@@ -1,0 +1,6 @@
+# ignore everything in this folder except a few things
+*
+!README.md
+!/.gitignore
+!t15_copyTaskData_description.csv
+!load_data.py
