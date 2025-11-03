@@ -16,7 +16,7 @@ model:
     input_trainable: true # whether the input layer is trainable
     input_layer_dropout: 0.2 # dropout rate for the input layer
 
-distributed: true # whether to use distributed training
+distributed: false # whether to use distributed training
 dist_url: null # url for distributed training
 world_size: null # number of gpus for distributed training
 mode: train

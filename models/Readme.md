@@ -12,6 +12,7 @@ This directory contains code and resources for training the brain-to-text RNN mo
 ### Minimalized - Optimized Forward Function for the Model
 - The forward function for the `Decoder` shared in the original repository had bloated steps decorated with a few unnecessary / computer intensive operations, these have been thoroughly reviewed and removed for code clarity and optimization.
 ### Update Train Scripts to Allow Distributed Training!!
+- WARNING: EXPERIMENTAL! This script may not be optimal and might not give expected loss reduction in mentioned number of epochs. Use this with caution, to disable distributed training and switch back to default, set distributed to false in `args.yaml`.
 
 ## Execute Training
 ```sh
