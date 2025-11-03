@@ -62,26 +62,17 @@ data/
 ## Quick Setup
 
 1.  **Install uv:**
-    ```bash
-    pip install uv
-    ```
-
-2.  **Create a virtual environment:**
-    ```bash
-    uv venv
-    ```
-
-3.  **Activate the virtual environment:**
     - On macOS and Linux:
-      ```bash
-      source .venv/bin/activate
-      ```
+        ```bash
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        ```
     - On Windows:
-      ```bash
-      .venv\Scripts\activate
-      ```
+        ```pwsh
+        powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+        ```
 
-4.  **Install dependencies:**
+2.  **Install dependencies:**
+    > Note: For linux / windows systems we default to CUDA 12.6 (`torch` / `torchaudio`), please re-configure this based on your system in `pyproject.toml` before running this command!
     ```bash
     uv sync
     ```
