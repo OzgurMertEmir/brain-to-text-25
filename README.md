@@ -8,7 +8,7 @@ This repository includes our model training and evaluation code for the [Brain-t
 ## Overview
 This repository contains the code and data built on top of the baseline shared in the paper ["*An Accurate and Rapidly Calibrating Speech Neuroprosthesis*" by Card et al. (2024), *N Eng J Med*](https://www.nejm.org/doi/full/10.1056/NEJMoa2314132).
 
-The code is organized into five main directories: `utils`, `misc`, `data`, `models`:
+The code is organized into four main directories: `utils`, `misc`, `data`, `models`:
 - The `utils` directory contains utility functions used throughout the code.
 - The `misc` directory contains abstract notebooks which contain analysis of data / model / other explorations.
 - The `data` directory contains the data necessary to reproduce the results in the paper. Download it from Dryad using the link above and place it in this directory.
