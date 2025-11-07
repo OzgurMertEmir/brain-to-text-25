@@ -300,9 +300,9 @@ class BrainToTextDecoder_Trainer:
 
         Day weights should have a separate learning rate
         '''
-        bias_params = [p for name, p in self.model.named_parameters() if 'gru.bias' in name or 'out.bias' in name]
+        bias_params = [p for name, p in self.model.named_parameters() if 'rnn.bias' in name or 'out.bias' in name]
         day_params = [p for name, p in self.model.named_parameters() if 'day_' in name]
-        other_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and 'gru.bias' not in name and 'out.bias' not in name]
+        other_params = [p for name, p in self.model.named_parameters() if 'day_' not in name and 'rnn.bias' not in name and 'out.bias' not in name]
 
         if len(day_params) != 0:
             param_groups = [
