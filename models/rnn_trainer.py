@@ -286,7 +286,7 @@ class BrainToTextDecoder_Trainer:
 
         # Set rnn and/or input layers to not trainable if specified
         for name, param in self.model.named_parameters():
-            if not self.args['model']['rnn_trainable'] and 'gru' in name:
+            if not self.args['model']['rnn_trainable'] and 'rnn' in name:
                 param.requires_grad = False
 
             elif not self.args['model']['input_network']['input_trainable'] and 'day' in name:
