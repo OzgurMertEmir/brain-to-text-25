@@ -1,100 +1,68 @@
-
+import json
+import math
+import pathlib
+import pickle
+import sys
+import time
+from omegaconf import OmegaConf
 import torch
+from torch.optim.lr_scheduler import LambdaLR
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import LambdaLR
-import random
-import time
+import torchaudio.functional as F
 import os
 import numpy as np
-import math
-import pathlib
+import random
 import logging
-import sys
-import json
-import pickle
-
-from dataset import BrainToTextDataset, train_test_split_indicies
-from data_augmentations import gauss_smooth
-
-import torchaudio.functional as F # for edit distance
-from omegaconf import OmegaConf
-
-# Use the new API for TF32 precision, as recommended by PyTorch
-torch.backends.cuda.matmul.fp32_precision = 'ieee'
-torch.backends.cudnn.conv.fp32_precision = 'ieee'
-torch.backends.cudnn.deterministic = True # makes training more reproducible
-torch._dynamo.config.cache_size_limit = 64
 
 from rnn_decoder import RNNDecoder
 
-class BrainToTextDecoder_Trainer:
-    """
-    This class will initialize and train a brain-to-text phoneme decoder
-    
-    Written by Nick Card and Zachery Fogg with reference to Stanford NPTL's decoding function
-    """
+from data_augmentations import gauss_smooth
+from dataset import BrainToTextDataset, train_test_split_indicies
 
+# Configure TF32 using the new API (avoids deprecation warnings in PyTorch 2.9+)
+torch.backends.cudnn.conv.fp32_precision = 'tf32'  # TF32 for cuDNN convolution operations
+torch.backends.cuda.matmul.fp32_precision = 'tf32'  # TF32 for matrix multiplication on Ampere+ GPUs
+torch.backends.cudnn.deterministic = True  # Makes training more reproducible
+torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
+torch._dynamo.config.cache_size_limit = 64  # Limit compilation cache size
+
+class RNNTrainer:
     def __init__(self, args, rank):
-        '''
-        args : dictionary of training arguments
-        '''
-
-        # Trainer fields
         self.args = args
-        self.rank = rank
-        self.is_distributed = self.rank is not None
-        self.logger = None
-        self.device = None
-        self.model = None
-        self.optimizer = None
-        self.learning_rate_scheduler = None
-        self.ctc_loss = None
-
-        self.best_val_PER = torch.inf # track best PER for checkpointing
-        self.best_val_loss = torch.inf # track best loss for checkpointing
-
-        self.train_dataset = None
-        self.val_dataset = None
-        self.train_loader = None
-        self.val_loader = None
-
-        self.transform_args = self.args['dataset']['data_transforms']
-
-        # On rank 0, create output and checkpoint directories
-        if not self.is_distributed or self.rank == 0:
-            # Create output directory
-            if args['mode'] == 'train':
-                os.makedirs(self.args['output_dir'], exist_ok=True)
-
-            # Create checkpoint directory
-            if args['save_best_checkpoint'] or args['save_all_val_steps'] or args['save_final_model']:
-                os.makedirs(self.args['checkpoint_dir'], exist_ok=True)
-
-        # Set up logging
+        #------------------------------------------------------------------
+        # Setup Logging
         self.logger = logging.getLogger(__name__)
-        for handler in self.logger.handlers[:]:  # make a copy of the list
-            self.logger.removeHandler(handler)
+        for handler in self.logger.handlers[:]: self.logger.removeHandler(handler)
         self.logger.setLevel(logging.INFO)
         formatter = logging.Formatter(fmt='%(asctime)s: %(message)s')
 
+        #------------------------------------------------------------------
+        # Setup Distributed Training
+        self.rank = rank
+        self.is_distributed = self.rank is not None
+
+        if not self.is_distributed or self.rank == 0:
+            if args['mode'] == 'train':
+                os.makedirs(self.args['output_dir'], exist_ok = True)
+            if args['save_best_checkpoint'] or args['save_all_val_steps'] or args['save_final_model']:
+                os.makedirs(self.args['checkpoint_dir'], exist_ok=True)
+
         if not self.is_distributed or self.rank == 0:
             if args['mode']=='train':
-                # During training, save logs to file in output directory
                 fh = logging.FileHandler(str(pathlib.Path(self.args['output_dir'],'training_log')))
                 fh.setFormatter(formatter)
                 self.logger.addHandler(fh)
 
-            # Always print logs to stdout
             sh = logging.StreamHandler(sys.stdout)
             sh.setFormatter(formatter)
             self.logger.addHandler(sh)
 
-        # Configure device pytorch will use
+        ## Setup Training Device
         if self.is_distributed:
-            dist.init_process_group(backend='nccl', init_method=self.args['dist_url'], world_size=self.args['world_size'], rank=self.rank)
+            dist.init_process_group(backend='nccl', init_method = self.args['dist_url'], world_size=self.args['world_size'], rank = self.rank)
             self.device = torch.device(f"cuda:{self.rank}")
             torch.cuda.set_device(self.rank)
             self.logger.info(f"Initialized distributed training on rank {self.rank}")
@@ -124,17 +92,18 @@ class BrainToTextDecoder_Trainer:
 
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f'Using device: {self.device}')
-
-
-
-        # Set seed if provided
+        
+        #------------------------------------------------------------------
+        #Init Seed
         if self.args['seed'] != -1:
+            ## Maintaing Variability accross GPUs
             seed = self.args['seed'] + self.rank if self.is_distributed else self.args['seed']
             np.random.seed(seed)
             random.seed(seed)
             torch.manual_seed(seed)
-
-        # Initialize the model
+        
+        #------------------------------------------------------------------
+        #Init Model
         self.model = RNNDecoder(
             neuron_capture_tensor_dim = self.args['model']['n_input_features'],
             hidden_state_dim = self.args['model']['n_units'],
@@ -148,28 +117,23 @@ class BrainToTextDecoder_Trainer:
             ts_patch_stride = self.args['model']['patch_stride'],
             bidirectional = self.args['model']['bidirectional']
         )
-
-        # Send model to device
         self.model.to(self.device)
-
-        # Call torch.compile to speed up training
-        if not self.is_distributed or self.rank == 0:
-            self.logger.info("Using torch.compile")
+        if not self.is_distributed or self.rank == 0: self.logger.info("Using torch.compile")
+        
         self.model = torch.compile(self.model)
-
         if self.is_distributed:
-            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
+            self.model = DDP(self.model, device_ids = [self.rank], find_unused_parameters=True)
 
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f"Initialized RNN decoding model")
             self.logger.info(self.model)
-
-        # Log how many parameters are in the model
+        
+        ## Log how many parameters are in the model
         total_params = sum(p.numel() for p in self.model.parameters())
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f"Model has {total_params:,} parameters")
 
-        # Determine how many day-specific parameters are in the model
+        ## Determine how many day-specific parameters are in the model
         day_params = 0
         for name, param in self.model.named_parameters():
             if 'day' in name:
@@ -178,17 +142,14 @@ class BrainToTextDecoder_Trainer:
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f"Model has {day_params:,} day-specific parameters | {((day_params / total_params) * 100):.2f}% of total parameters")
 
-        # Create datasets and dataloaders
+        #------------------------------------------------------------------
+        #Init Datasets
         train_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_train.hdf5') for s in self.args['dataset']['sessions']]
         val_file_paths = [os.path.join(self.args["dataset"]["dataset_dir"],s,'data_val.hdf5') for s in self.args['dataset']['sessions']]
 
-        # Ensure that there are no duplicate days
-        if len(set(train_file_paths)) != len(train_file_paths):
-            raise ValueError("There are duplicate sessions listed in the train dataset")
-        if len(set(val_file_paths)) != len(val_file_paths):
-            raise ValueError("There are duplicate sessions listed in the val dataset")
-
-        # Split trials into train and test sets
+        if len(set(train_file_paths)) != len(train_file_paths): raise ValueError("There are duplicate sessions listed in the train dataset")
+        if len(set(val_file_paths)) != len(val_file_paths): raise ValueError("There are duplicate sessions listed in the val dataset")
+        
         train_trials, _ = train_test_split_indicies(
             file_paths = train_file_paths,
             test_percentage = 0,
@@ -251,6 +212,7 @@ class BrainToTextDecoder_Trainer:
             random_seed = self.args['dataset']['seed'],
             feature_subset = feature_subset
             )
+        
         self.val_loader = DataLoader(
             self.val_dataset,
             batch_size = None, # Dataset.__getitem__() already returns batches
@@ -262,28 +224,32 @@ class BrainToTextDecoder_Trainer:
         if not self.is_distributed or self.rank == 0:
             self.logger.info("Successfully initialized datasets")
 
-        # Create optimizer, learning rate scheduler, and loss
+        #------------------------------------------------------------------
+        #Init Optimizer
         self.optimizer = self.create_optimizer()
 
         if self.args['lr_scheduler_type'] == 'linear':
             self.learning_rate_scheduler = torch.optim.lr_scheduler.LinearLR(
                 optimizer = self.optimizer,
                 start_factor = 1.0,
-                end_factor = self.args['lr_min'] / self.args['lr_max'],
-                total_iters = self.args['lr_decay_steps'],
+                end_factor = self.args['lr_min']/ self.args['lr_max'],
+                total_iters = self.args['lr_decay_steps']
             )
         elif self.args['lr_scheduler_type'] == 'cosine':
             self.learning_rate_scheduler = self.create_cosine_lr_scheduler(self.optimizer)
-
         else:
             raise ValueError(f"Invalid learning rate scheduler type: {self.args['lr_scheduler_type']}")
 
-        self.ctc_loss = torch.nn.CTCLoss(blank = 0, reduction = 'none', zero_infinity = False)
-
-        # If a checkpoint is provided, then load from checkpoint
+        #------------------------------------------------------------------
+        #Init Loss
+        self.ctc_loss = torch.nn.CTCLoss(blank = 0, reduction='none', zero_infinity=False)
+        
+        #------------------------------------------------------------------
+        #Load from checkpoint
         if self.args['init_from_checkpoint']:
             self.load_model_checkpoint(self.args['init_checkpoint_path'])
 
+        #------------------------------------------------------------------
         # Set rnn and/or input layers to not trainable if specified
         for name, param in self.model.named_parameters():
             if not self.args['model']['rnn_trainable'] and 'rnn' in name:
@@ -291,14 +257,20 @@ class BrainToTextDecoder_Trainer:
 
             elif not self.args['model']['input_network']['input_trainable'] and 'day' in name:
                 param.requires_grad = False
+        
+        #------------------------------------------------------------------
+        # Load data transform args
+        self.transform_args = self.args['dataset']['data_transforms']
 
+        #------------------------------------------------------------------
+        # Initialize best validation PER & Loss
+        self.best_val_PER = torch.inf
+        self.best_val_loss = torch.inf
+    
     def create_optimizer(self):
         '''
-        Create the optimizer with special param groups
-
-        Biases and day weights should not be decayed
-
-        Day weights should have a separate learning rate
+        we choose not to decay biases and day wegihts 
+        day weights should have a seperate learning rate
         '''
         bias_params = [p for name, p in self.model.named_parameters() if 'rnn.bias' in name or 'out.bias' in name]
         day_params = [p for name, p in self.model.named_parameters() if 'day_' in name]
@@ -315,7 +287,7 @@ class BrainToTextDecoder_Trainer:
                     {'params' : bias_params, 'weight_decay' : 0, 'group_type' : 'bias'},
                     {'params' : other_params, 'group_type' : 'other'}
                 ]
-
+        
         optim = torch.optim.AdamW(
             param_groups,
             lr = self.args['lr_max'],
@@ -326,7 +298,7 @@ class BrainToTextDecoder_Trainer:
         )
 
         return optim
-
+    
     def create_cosine_lr_scheduler(self, optim):
         lr_max = self.args['lr_max']
         lr_min = self.args['lr_min']
@@ -340,25 +312,12 @@ class BrainToTextDecoder_Trainer:
         lr_warmup_steps_day = self.args['lr_warmup_steps_day']
 
         def lr_lambda(current_step, min_lr_ratio, decay_steps, warmup_steps):
-            '''
-            Create lr lambdas for each param group that implement cosine decay
-
-            Different lr lambda decaying for day params vs rest of the model
-            '''
-            # Warmup phase
             if current_step < warmup_steps:
                 return float(current_step) / float(max(1, warmup_steps))
-
-            # Cosine decay phase
             if current_step < decay_steps:
-                progress = float(current_step - warmup_steps) / float(
-                    max(1, decay_steps - warmup_steps)
-                )
+                progress = float(current_step - warmup_steps) / float(max(1, decay_steps - warmup_steps))
                 cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
-                # Scale from 1.0 to min_lr_ratio
-                return max(min_lr_ratio, min_lr_ratio + (1 - min_lr_ratio) * cosine_decay)
-
-            # After cosine decay is complete, maintain min_lr_ratio
+                return max(min_lr_ratio, min_lr_ratio + (1 - min_lr_ratio)*(cosine_decay))
             return min_lr_ratio
 
         if len(optim.param_groups) == 3:
@@ -396,94 +355,13 @@ class BrainToTextDecoder_Trainer:
         else:
             raise ValueError(f"Invalid number of param groups in optimizer: {len(optim.param_groups)}")
 
-        return LambdaLR(optim, lr_lambdas, -1)
-
-    def load_model_checkpoint(self, load_path):
-        '''
-        Load a training checkpoint
-        '''
-        checkpoint = torch.load(load_path, weights_only = False) # checkpoint is just a dict
-
-        model_to_load = self.model.module if self.is_distributed else self.model
-        model_to_load.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.learning_rate_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.best_val_PER = checkpoint['val_PER'] # best phoneme error rate
-        self.best_val_loss = checkpoint['val_loss'] if 'val_loss' in checkpoint.keys() else torch.inf
-
-        self.model.to(self.device)
-
-        # Send optimizer params back to GPU
-        for state in self.optimizer.state.values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(self.device)
-
-        if not self.is_distributed or self.rank == 0:
-            self.logger.info("Loaded model from checkpoint: " + load_path)
-
-    def save_model_checkpoint(self, save_path, PER, loss):
-        '''
-        Save a training checkpoint
-        '''
-
-        model_state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
-        checkpoint = {
-            'model_state_dict' : model_state_dict,
-            'optimizer_state_dict' : self.optimizer.state_dict(),
-            'scheduler_state_dict' : self.learning_rate_scheduler.state_dict(),
-            'val_PER' : PER,
-            'val_loss' : loss
-        }
-
-        torch.save(checkpoint, save_path)
-
-        if not self.is_distributed or self.rank == 0:
-            self.logger.info("Saved model to checkpoint: " + save_path)
-
-            # Save the args file alongside the checkpoint
-            with open(os.path.join(self.args['checkpoint_dir'], 'args.yaml'), 'w') as f:
-                OmegaConf.save(config=self.args, f=f)
-
-    def create_attention_mask(self, sequence_lengths):
-
-        max_length = torch.max(sequence_lengths).item()
-
-        batch_size = sequence_lengths.size(0)
-
-        # Create a mask for valid key positions (columns)
-        # Shape: [batch_size, max_length]
-        key_mask = torch.arange(max_length, device=sequence_lengths.device).expand(batch_size, max_length)
-        key_mask = key_mask < sequence_lengths.unsqueeze(1)
-
-        # Expand key_mask to [batch_size, 1, 1, max_length]
-        # This will be broadcast across all query positions
-        key_mask = key_mask.unsqueeze(1).unsqueeze(1)
-
-        # Create the attention mask of shape [batch_size, 1, max_length, max_length]
-        # by broadcasting key_mask across all query positions
-        attention_mask = key_mask.expand(batch_size, 1, max_length, max_length)
-
-        # Convert boolean mask to float mask:
-        # - True (valid key positions) -> 0.0 (no change to attention scores)
-        # - False (padding key positions) -> -inf (will become 0 after softmax)
-        attention_mask_float = torch.where(attention_mask,
-                                        True,
-                                        False)
-
-        return attention_mask_float
-
+        return LambdaLR(optim, lr_lambdas)
+    
     def transform_data(self, features, n_time_steps, mode = 'train'):
-        '''
-        Apply various augmentations and smoothing to data
-        Performing augmentations is much faster on GPU than CPU
-        '''
-
         data_shape = features.shape
         batch_size = data_shape[0]
         channels = data_shape[-1]
 
-        # We only apply these augmentations in training
         if mode == 'train':
             # add static gain noise
             if self.transform_args['static_gain_std'] > 0:
@@ -523,15 +401,164 @@ class BrainToTextDecoder_Trainer:
 
         return features, n_time_steps
 
+    def validation(self, loader, return_logits = False, return_data = False):
+        self.model.eval()
+        metrics = {
+            'decoded_seqs': [],
+            'true_seq': [],
+            'phone_seq_lens': [],
+            'transcription': [],
+            'losses': [],
+            'block_nums': [],
+            'trial_nums': [],
+            'day_indicies': []
+        }
+
+        if return_logits:
+            metrics['logits'] = []
+            metrics['n_time_steps'] = []
+        
+        if return_data:
+            metrics['input_features'] = []
+        
+        total_edit_distance = 0
+        total_seq_len = 0
+
+        day_per = {}
+        for d in range(len(self.args['dataset']['sessions'])):
+            if self.args['dataset']['dataset_probability_val'][d] == 1:
+                day_per[d] = {'total_edit_distance' : 0, 'total_seq_length' : 0}
+
+        for _, batch in enumerate(loader):
+            features = batch['input_features'].to(self.device)
+            labels = batch['seq_class_ids'].to(self.device)
+            n_time_steps = batch['n_time_steps'].to(self.device)
+            phone_seq_lens = batch['phone_seq_lens'].to(self.device)
+            day_indicies = batch['day_indicies'].to(self.device)
+
+            day = day_indicies[0].item() # validation batches are day specific
+            if self.args['dataset']['dataset_probability_val'][day] == 0:
+                if self.args['log_val_skip_logs']:
+                    self.logger.info(f"Skipping validation on day {day}")
+                continue
+                
+            with torch.no_grad():
+                with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
+                    features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
+
+                    adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
+
+                    logits = self.model(features, day_indicies)
+
+                    loss = self.ctc_loss(
+                        torch.permute(logits.log_softmax(2), [1, 0, 2]),
+                        labels,
+                        adjusted_lens,
+                        phone_seq_lens,
+                    )
+                    loss = torch.mean(loss)
+
+                metrics['losses'].append(loss.cpu().detach().numpy())
+
+                batch_edit_distance = 0
+                decoded_seqs = []
+
+                for iterIdx in range(logits.shape[0]):
+                    decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :], dim=-1)
+                    decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
+                    decoded_seq = decoded_seq.cpu().detach().numpy()
+                    decoded_seq = np.array([i for i in decoded_seq if i != 0])
+
+                    trueSeq = np.array(
+                        labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
+                    )
+            
+                    batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+
+                    decoded_seqs.append(decoded_seq)
+
+            day = batch['day_indicies'][0].item()
+
+            day_per[day]['total_edit_distance'] += batch_edit_distance
+            day_per[day]['total_seq_length'] += torch.sum(phone_seq_lens).item()
+
+            total_edit_distance += batch_edit_distance
+            total_seq_len += torch.sum(phone_seq_lens)
+
+            if return_logits:
+                metrics['logits'].append(logits.cpu().float().numpy()) # Will be in bfloat16 if AMP is enabled, so need to set back to float32
+                metrics['n_time_steps'].append(adjusted_lens.cpu().numpy())
+
+            if return_data:
+                metrics['input_features'].append(batch['input_features'].cpu().numpy())
+
+            metrics['decoded_seqs'].append(decoded_seqs)
+            metrics['true_seq'].append(batch['seq_class_ids'].cpu().numpy())
+            metrics['phone_seq_lens'].append(batch['phone_seq_lens'].cpu().numpy())
+            metrics['transcription'].append(batch['transcriptions'].cpu().numpy())
+            metrics['losses'].append(loss.detach().item())
+            metrics['block_nums'].append(batch['block_nums'].numpy())
+            metrics['trial_nums'].append(batch['trial_nums'].numpy())
+            metrics['day_indicies'].append(batch['day_indicies'].cpu().numpy())
+
+        avg_PER = total_edit_distance / total_seq_len
+
+        metrics['day_PERs'] = day_per
+        metrics['avg_PER'] = avg_PER.item()
+        metrics['avg_loss'] = np.mean(metrics['losses'])
+
+        return metrics
+
+    def load_model_checkpoint(self, load_path):
+        '''
+        Load a training checkpoint
+        '''
+        checkpoint = torch.load(load_path, weights_only = False) # checkpoint is just a dict
+
+        model_to_load = self.model.module if self.is_distributed else self.model
+        model_to_load.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.learning_rate_scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.best_val_PER = checkpoint['val_PER'] # best phoneme error rate
+        self.best_val_loss = checkpoint['val_loss'] if 'val_loss' in checkpoint.keys() else torch.inf
+
+        self.model.to(self.device)
+
+        # Send optimizer params back to GPU
+        for state in self.optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(self.device)
+
+        if not self.is_distributed or self.rank == 0:
+            self.logger.info("Loaded model from checkpoint: " + load_path)
+
+    def save_model_checkpoint(self, save_path, best_PER, best_loss):
+        '''
+        Save a training checkpoint
+        '''
+
+        model_state_dict = self.model.module.state_dict() if self.is_distributed else self.model.state_dict()
+        checkpoint = {
+            'model_state_dict' : model_state_dict,
+            'optimizer_state_dict' : self.optimizer.state_dict(),
+            'scheduler_state_dict' : self.learning_rate_scheduler.state_dict(),
+            'val_PER' : best_PER,
+            'val_loss' : best_loss
+        }
+
+        torch.save(checkpoint, save_path)
+
+        if not self.is_distributed or self.rank == 0:
+            self.logger.info("Saved model to checkpoint: " + save_path)
+
+            # Save the args file alongside the checkpoint
+            with open(os.path.join(self.args['checkpoint_dir'], 'args.yaml'), 'w') as f:
+                OmegaConf.save(config=self.args, f=f)
+                
     def train(self):
-        '''
-        Train the model
-        '''
-
-        # Set model to train mode (specificially to make sure dropout layers are engaged)
-        self.model.train()
-
-        # create vars to track performance
+        #------------------------------------------------------------------
+        # performance tracking
         train_losses = []
         val_losses = []
         val_PERs = []
@@ -539,103 +566,94 @@ class BrainToTextDecoder_Trainer:
 
         val_steps_since_improvement = 0
 
+        #------------------------------------------------------------------
         # training params
         save_best_checkpoint = self.args.get('save_best_checkpoint', True)
         early_stopping = self.args.get('early_stopping', True)
-
         early_stopping_val_steps = self.args['early_stopping_val_steps']
 
+        #------------------------------------------------------------------
+        # Start Training
         train_start_time = time.time()
 
-        # train for specified number of batches
         for i, batch in enumerate(self.train_loader):
-            if self.is_distributed:
-                self.train_loader.sampler.set_epoch(i)
-
+            # this is needed to select a different training batch for each epoch
+            if self.is_distributed: self.train_loader.sampler.set_epoch(i)
+            #------------------------------------------------------------------
+            # Set model to train mode: Enables Dropout / Running Averages on Norms etc.
             self.model.train()
             self.optimizer.zero_grad()
 
-            # Train step
-            start_time = time.time()
+            epoch_start_time = time.time()
 
-            # Move data to device
             features = batch['input_features'].to(self.device)
             labels = batch['seq_class_ids'].to(self.device)
             n_time_steps = batch['n_time_steps'].to(self.device)
             phone_seq_lens = batch['phone_seq_lens'].to(self.device)
-            day_indicies = batch['day_indicies'].to(self.device)
+            day_indices = batch['day_indicies'].to(self.device)
 
-            # Use autocast for efficiency
             with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
-
-                # Apply augmentations to the data
                 features, n_time_steps = self.transform_data(features, n_time_steps, 'train')
-
+                # As we squash time steps into windows during model forward pass
                 adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-
-                # Get phoneme predictions
-                logits = self.model(features, day_indicies)
-
-                # Calculate CTC Loss
+                logits = self.model(features, day_indices)
                 loss = self.ctc_loss(
-                    log_probs = torch.permute(logits.log_softmax(2), [1, 0, 2]),
+                    log_probs = torch.permute(logits.log_softmax(2), (1, 0, 2)), # expected input dimension (T, N, S)
                     targets = labels,
                     input_lengths = adjusted_lens,
                     target_lengths = phone_seq_lens
-                    )
+                )
 
-                loss = torch.mean(loss) # take mean loss over batches
-
+                loss = torch.mean(loss)
+            
             loss.backward()
 
-            # Clip gradient
+            #------------------------------------------------------------------
+            # Clip Gradients
             if self.args['grad_norm_clip_value'] > 0:
                 grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(),
-                                               max_norm = self.args['grad_norm_clip_value'],
-                                               error_if_nonfinite = True,
-                                               foreach = True
-                                               )
-
+                                max_norm = self.args['grad_norm_clip_value'],
+                                error_if_nonfinite = True,
+                                foreach=True
+                            )
+            
             self.optimizer.step()
             self.learning_rate_scheduler.step()
 
-            # Save training metrics
-            train_step_duration = time.time() - start_time
+            train_step_duration = time.time() - epoch_start_time
             train_losses.append(loss.detach().item())
+            # Train Step Complete
+            #-----------------------------------------------------------------
 
-            # Incrementally log training progress
+            # Logging
             if i % self.args['batches_per_train_log'] == 0 and (not self.is_distributed or self.rank == 0):
                 self.logger.info(f'Train batch {i}: ' +
-                        f'loss: {(loss.detach().item()):.2f} ' +
-                        f'grad norm: {grad_norm:.2f} ' +
-                        f'time: {train_step_duration:.3f}')
+                    f'loss: {(loss.detach().item()):.2f} ' +
+                    f'grad norm: {grad_norm:.2f} ' +
+                    f'time: {train_step_duration:.3f}')
 
-            # Incrementally run a test step
+            #-----------------------------------------------------------------
+            # Validation
             if (i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1))) and (not self.is_distributed or self.rank == 0):
                 self.logger.info(f"Running test after training batch: {i}")
 
-                # Calculate metrics on val data
-                start_time = time.time()
+                val_start_time = time.time()
                 val_metrics = self.validation(loader = self.val_loader, return_logits = self.args['save_val_logits'], return_data = self.args['save_val_data'])
-                val_step_duration = time.time() - start_time
+                val_step_duration = time.time() - val_start_time
 
-
-                # Log info
                 self.logger.info(f'Val batch {i}: ' +
-                        f'PER (avg): {val_metrics["avg_PER"]:.4f} ' +
-                        f'CTC Loss (avg): {val_metrics["avg_loss"]:.4f} ' +
-                        f'time: {val_step_duration:.3f}')
-
+                    f'PER (avg): {val_metrics["avg_PER"]:.4f} ' +
+                    f'CTC Loss (avg): {val_metrics["avg_loss"]:.4f} ' +
+                    f'time: {val_step_duration:.3f}')
+                
                 if self.args['log_individual_day_val_PER']:
                     for day in val_metrics['day_PERs'].keys():
                         self.logger.info(f"{self.args['dataset']['sessions'][day]} val PER: {val_metrics['day_PERs'][day]['total_edit_distance'] / val_metrics['day_PERs'][day]['total_seq_length']:0.4f}")
-
-                # Save metrics
+                
                 val_PERs.append(val_metrics['avg_PER'])
                 val_losses.append(val_metrics['avg_loss'])
                 val_results.append(val_metrics)
 
-                # Determine if new best day. Based on if PER is lower, or in the case of a PER tie, if loss is lower
                 new_best = False
                 if val_metrics['avg_PER'] < self.best_val_PER:
                     self.logger.info(f"New best test PER {self.best_val_PER:.4f} --> {val_metrics['avg_PER']:.4f}")
@@ -648,19 +666,15 @@ class BrainToTextDecoder_Trainer:
                     new_best = True
 
                 if new_best:
-
                     # Checkpoint if metrics have improved
                     if save_best_checkpoint:
                         self.logger.info(f"Checkpointing model")
                         self.save_model_checkpoint(f'{self.args["checkpoint_dir"]}/best_checkpoint', self.best_val_PER, self.best_val_loss)
-
                     # save validation metrics to pickle file
                     if self.args['save_val_metrics']:
                         with open(f'{self.args["checkpoint_dir"]}/val_metrics.pkl', 'wb') as f:
                             pickle.dump(val_metrics, f)
-
                     val_steps_since_improvement = 0
-
                 else:
                     val_steps_since_improvement +=1
 
@@ -672,10 +686,8 @@ class BrainToTextDecoder_Trainer:
                 if early_stopping and (val_steps_since_improvement >= early_stopping_val_steps):
                     self.logger.info(f'Overall validation PER has not improved in {early_stopping_val_steps} validation steps. Stopping training early at batch: {i}')
                     break
-
-        # Log final training steps
+        
         training_duration = time.time() - train_start_time
-
 
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f'Best avg val PER achieved: {self.best_val_PER:.5f}')
@@ -695,122 +707,3 @@ class BrainToTextDecoder_Trainer:
             dist.destroy_process_group()
 
         return train_stats
-
-    def validation(self, loader, return_logits = False, return_data = False):
-        '''
-        Calculate metrics on the validation dataset
-        '''
-        self.model.eval()
-
-        metrics = {}
-
-        # Record metrics
-        if return_logits:
-            metrics['logits'] = []
-            metrics['n_time_steps'] = []
-
-        if return_data:
-            metrics['input_features'] = []
-
-        metrics['decoded_seqs'] = []
-        metrics['true_seq'] = []
-        metrics['phone_seq_lens'] = []
-        metrics['transcription'] = []
-        metrics['losses'] = []
-        metrics['block_nums'] = []
-        metrics['trial_nums'] = []
-        metrics['day_indicies'] = []
-
-        total_edit_distance = 0
-        total_seq_length = 0
-
-        # Calculate PER for each specific day
-        day_per = {}
-        for d in range(len(self.args['dataset']['sessions'])):
-            if self.args['dataset']['dataset_probability_val'][d] == 1:
-                day_per[d] = {'total_edit_distance' : 0, 'total_seq_length' : 0}
-
-        for i, batch in enumerate(loader):
-
-            features = batch['input_features'].to(self.device)
-            labels = batch['seq_class_ids'].to(self.device)
-            n_time_steps = batch['n_time_steps'].to(self.device)
-            phone_seq_lens = batch['phone_seq_lens'].to(self.device)
-            day_indicies = batch['day_indicies'].to(self.device)
-
-            # Determine if we should perform validation on this batch
-            day = day_indicies[0].item()
-            if self.args['dataset']['dataset_probability_val'][day] == 0:
-                if self.args['log_val_skip_logs']:
-                    self.logger.info(f"Skipping validation on day {day}")
-                continue
-
-            with torch.no_grad():
-
-                with torch.autocast(device_type = "cuda", enabled = self.args['use_amp'], dtype = torch.bfloat16):
-                    features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
-
-                    adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-
-                    logits = self.model(features, day_indicies)
-
-                    loss = self.ctc_loss(
-                        torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                        labels,
-                        adjusted_lens,
-                        phone_seq_lens,
-                    )
-                    loss = torch.mean(loss)
-
-                metrics['losses'].append(loss.cpu().detach().numpy())
-
-                # Calculate PER per day and also avg over entire validation set
-                batch_edit_distance = 0
-                decoded_seqs = []
-                for iterIdx in range(logits.shape[0]):
-                    decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :].clone().detach(),dim=-1)
-                    decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
-                    decoded_seq = decoded_seq.cpu().detach().numpy()
-                    decoded_seq = np.array([i for i in decoded_seq if i != 0])
-
-                    trueSeq = np.array(
-                        labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
-                    )
-
-                    batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
-
-                    decoded_seqs.append(decoded_seq)
-
-            day = batch['day_indicies'][0].item()
-
-            day_per[day]['total_edit_distance'] += batch_edit_distance
-            day_per[day]['total_seq_length'] += torch.sum(phone_seq_lens).item()
-
-
-            total_edit_distance += batch_edit_distance
-            total_seq_length += torch.sum(phone_seq_lens)
-
-            # Record metrics
-            if return_logits:
-                metrics['logits'].append(logits.cpu().float().numpy()) # Will be in bfloat16 if AMP is enabled, so need to set back to float32
-                metrics['n_time_steps'].append(adjusted_lens.cpu().numpy())
-
-            if return_data:
-                metrics['input_features'].append(batch['input_features'].cpu().numpy())
-
-            metrics['decoded_seqs'].append(decoded_seqs)
-            metrics['true_seq'].append(batch['seq_class_ids'].cpu().numpy())
-            metrics['phone_seq_lens'].append(batch['phone_seq_lens'].cpu().numpy())
-            metrics['transcription'].append(batch['transcriptions'].cpu().numpy())
-            metrics['losses'].append(loss.detach().item())
-            metrics['block_nums'].append(batch['block_nums'].numpy())
-            metrics['trial_nums'].append(batch['trial_nums'].numpy())
-            metrics['day_indicies'].append(batch['day_indicies'].cpu().numpy())
-
-        avg_PER = total_edit_distance / total_seq_length
-
-        metrics['day_PERs'] = day_per
-        metrics['avg_PER'] = avg_PER.item()
-        metrics['avg_loss'] = np.mean(metrics['losses'])
-
-        return metrics

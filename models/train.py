@@ -1,14 +1,14 @@
 import torch
 import torch.multiprocessing as mp
 from omegaconf import OmegaConf
-from rnn_trainer import BrainToTextDecoder_Trainer
+from rnn_trainer import RNNTrainer
 import os
 
 def main_worker(rank, args):
     """
     Main worker function for distributed training.
     """
-    trainer = BrainToTextDecoder_Trainer(args, rank)
+    trainer = RNNTrainer(args, rank)
     trainer.train()
 
 if __name__ == '__main__':
@@ -21,5 +21,5 @@ if __name__ == '__main__':
         args.world_size = torch.cuda.device_count()
         mp.spawn(main_worker, nprocs=args.world_size, args=(args,))
     else:
-        trainer = BrainToTextDecoder_Trainer(args, None)
+        trainer = RNNTrainer(args, None)
         metrics = trainer.train()
