@@ -5,9 +5,10 @@ from collections import defaultdict
 import heapq
 
 class CTCBeamSearchDecoder:
-    def __init__(self, blank_id: int = 0, beam_width: int = 10):
+    def __init__(self, blank_id: int = 0, beam_width: int = 10, prune_threshold: float = -10.0):
         self.blank_id = blank_id
         self.beam_width = beam_width
+        self.prune_threshold = prune_threshold  # Skip tokens with log_prob < best + threshold
     
     def _log_sum_exp(self, a: float, b: float) -> float:
         if a == -np.inf and b == -np.inf:
@@ -38,23 +39,32 @@ class CTCBeamSearchDecoder:
             next_beams = defaultdict(lambda: (-np.inf, -np.inf))
             log_probs_t = log_probs[t]  # Cache current timestep probs
 
+            # OPTIMIZATION: Find top-k tokens at this timestep to consider
+            # This dramatically reduces the search space
+            max_log_prob = np.max(log_probs_t)
+            active_tokens = np.where(log_probs_t >= max_log_prob + self.prune_threshold)[0]
+
             for prefix, (log_p_b, log_p_nb) in beams.items():
                 log_p_total = self._log_sum_exp(log_p_b, log_p_nb)
 
-                prob_blank = log_probs_t[self.blank_id]
-                curr_log_p_b, curr_log_p_nb = next_beams[prefix]
-                next_beams[prefix] = (
-                    self._log_sum_exp(curr_log_p_b, log_p_total + prob_blank),
-                    curr_log_p_nb
-                )
+                # Blank extension
+                if self.blank_id in active_tokens or self.blank_id == 0:  # Always consider blank
+                    prob_blank = log_probs_t[self.blank_id]
+                    curr_log_p_b, curr_log_p_nb = next_beams[prefix]
+                    next_beams[prefix] = (
+                        self._log_sum_exp(curr_log_p_b, log_p_total + prob_blank),
+                        curr_log_p_nb
+                    )
 
-                for c in range(num_classes):
+                # Non-blank extensions (only consider active tokens)
+                for c in active_tokens:
                     if c == self.blank_id:
                         continue
 
                     prob_c = log_probs_t[c]
 
                     if len(prefix) > 0 and c == prefix[-1]:
+                        # Same character - extends from p_b, stays from p_nb
                         new_prefix = prefix + (c,)
                         curr_log_p_b, curr_log_p_nb = next_beams[new_prefix]
                         next_beams[new_prefix] = (
@@ -68,6 +78,7 @@ class CTCBeamSearchDecoder:
                             self._log_sum_exp(curr_log_p_nb, log_p_nb + prob_c)
                         )
                     else:
+                        # Different character - uses total probability
                         new_prefix = prefix + (c,)
                         curr_log_p_b, curr_log_p_nb = next_beams[new_prefix]
                         next_beams[new_prefix] = (

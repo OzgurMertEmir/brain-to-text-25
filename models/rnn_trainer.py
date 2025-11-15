@@ -250,9 +250,14 @@ class RNNTrainer:
         self.use_beam_search = self.args.get('use_beam_search', False)
         if self.use_beam_search:
             self.beam_width = self.args.get('beam_width', 10)
-            self.beam_search_decoder = CTCBeamSearchDecoder(blank_id=0, beam_width=self.beam_width)
+            prune_threshold = self.args.get('beam_prune_threshold', -10.0)
+            self.beam_search_decoder = CTCBeamSearchDecoder(
+                blank_id=0,
+                beam_width=self.beam_width,
+                prune_threshold=prune_threshold
+            )
             if not self.is_distributed or self.rank == 0:
-                self.logger.info(f"Using beam search decoding with beam_width={self.beam_width}")
+                self.logger.info(f"Using beam search decoding with beam_width={self.beam_width}, prune_threshold={prune_threshold}")
         else:
             if not self.is_distributed or self.rank == 0:
                 self.logger.info("Using greedy decoding")
@@ -663,7 +668,7 @@ class RNNTrainer:
             #-----------------------------------------------------------------
             # Validation
             if (i % self.args['batches_per_val_step'] == 0 or i == ((self.args['num_training_batches'] - 1))) and (not self.is_distributed or self.rank == 0):
-                self.logger.info(f"Running test after training batch: {i}")
+                self.logger.info(f"Running validation after training batch: {i}")
 
                 val_start_time = time.time()
                 val_metrics = self.validation(loader = self.val_loader, return_logits = self.args['save_val_logits'], return_data = self.args['save_val_data'])
