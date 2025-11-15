@@ -251,11 +251,20 @@ class RNNTrainer:
         if self.use_beam_search:
             self.beam_width = self.args.get('beam_width', 10)
             prune_threshold = self.args.get('beam_prune_threshold', -10.0)
+            verbose = self.args.get('beam_search_logging', False)
             self.beam_search_decoder = CTCBeamSearchDecoder(
                 blank_id=0,
                 beam_width=self.beam_width,
-                prune_threshold=prune_threshold
+                prune_threshold=prune_threshold,
+                verbose = verbose
             )
+
+            # Share logger handlers with beam search decoder
+            beam_logger = logging.getLogger('ctc_beam_search')
+            for handler in self.logger.handlers:
+                beam_logger.addHandler(handler)
+            beam_logger.setLevel(logging.INFO)
+
             if not self.is_distributed or self.rank == 0:
                 self.logger.info(f"Using beam search decoding with beam_width={self.beam_width}, prune_threshold={prune_threshold}")
         else:
@@ -483,8 +492,9 @@ class RNNTrainer:
 
                 # Decode sequences (greedy or beam search)
                 if self.use_beam_search:
-                    # Beam search decoding
-                    decoded_seqs_batch = self.beam_search_decoder.decode_batch(logits, adjusted_lens)
+                    # Beam search decoding - use parallel processing for large batches
+                    use_parallel = logits.shape[0] >= 8  # Enable for batches of 8+
+                    decoded_seqs_batch = self.beam_search_decoder.decode_batch(logits, adjusted_lens, parallel=use_parallel)
 
                     for iterIdx in range(logits.shape[0]):
                         decoded_seq = decoded_seqs_batch[iterIdx]
