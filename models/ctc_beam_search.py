@@ -84,11 +84,11 @@ class CTCBeamSearchDecoder:
     def decode_batch(self, logits: torch.Tensor, logit_lengths: torch.Tensor) -> List[np.ndarray]:
       """
       Decode a batch of logits using beam search.
-      
+
       Args:
           logits: Tensor of shape (batch_size, max_time, num_classes)
           logit_lengths: Tensor of shape (batch_size,) containing actual lengths
-      
+
       Returns:
           List of decoded sequences (as numpy arrays)
       """
@@ -97,7 +97,8 @@ class CTCBeamSearchDecoder:
 
       for i in range(batch_size):
           seq_len = logit_lengths[i].item()
-          log_probs = logits[i, :seq_len, :].log_softmax(dim=-1).cpu().numpy()
+          # Convert to float32 first (handles bfloat16 from AMP), then log_softmax
+          log_probs = logits[i, :seq_len, :].float().log_softmax(dim=-1).cpu().numpy()
           decoded_seq = self.decode_single(log_probs)
           decoded_sequences.append(decoded_seq)
 
