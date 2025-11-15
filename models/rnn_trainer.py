@@ -18,6 +18,7 @@ import random
 import logging
 
 from rnn_decoder import RNNDecoder
+from ctc_beam_search import CTCBeamSearchDecoder
 
 from data_augmentations import gauss_smooth
 from dataset import BrainToTextDataset, train_test_split_indicies
@@ -243,7 +244,19 @@ class RNNTrainer:
         #------------------------------------------------------------------
         #Init Loss
         self.ctc_loss = torch.nn.CTCLoss(blank = 0, reduction='none', zero_infinity=False)
-        
+
+        #------------------------------------------------------------------
+        #Init Beam Search Decoder (optional)
+        self.use_beam_search = self.args.get('use_beam_search', False)
+        if self.use_beam_search:
+            self.beam_width = self.args.get('beam_width', 10)
+            self.beam_search_decoder = CTCBeamSearchDecoder(blank_id=0, beam_width=self.beam_width)
+            if not self.is_distributed or self.rank == 0:
+                self.logger.info(f"Using beam search decoding with beam_width={self.beam_width}")
+        else:
+            if not self.is_distributed or self.rank == 0:
+                self.logger.info("Using greedy decoding")
+
         #------------------------------------------------------------------
         #Load from checkpoint
         if self.args['init_from_checkpoint']:
@@ -463,19 +476,34 @@ class RNNTrainer:
                 batch_edit_distance = 0
                 decoded_seqs = []
 
-                for iterIdx in range(logits.shape[0]):
-                    decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :], dim=-1)
-                    decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
-                    decoded_seq = decoded_seq.cpu().detach().numpy()
-                    decoded_seq = np.array([i for i in decoded_seq if i != 0])
+                # Decode sequences (greedy or beam search)
+                if self.use_beam_search:
+                    # Beam search decoding
+                    decoded_seqs_batch = self.beam_search_decoder.decode_batch(logits, adjusted_lens)
 
-                    trueSeq = np.array(
-                        labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
-                    )
-            
-                    batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+                    for iterIdx in range(logits.shape[0]):
+                        decoded_seq = decoded_seqs_batch[iterIdx]
+                        trueSeq = np.array(
+                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
+                        )
 
-                    decoded_seqs.append(decoded_seq)
+                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+                        decoded_seqs.append(decoded_seq)
+                else:
+                    # Greedy decoding
+                    for iterIdx in range(logits.shape[0]):
+                        decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :], dim=-1)
+                        decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
+                        decoded_seq = decoded_seq.cpu().detach().numpy()
+                        decoded_seq = np.array([i for i in decoded_seq if i != 0])
+
+                        trueSeq = np.array(
+                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
+                        )
+
+                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+
+                        decoded_seqs.append(decoded_seq)
 
             day = batch['day_indicies'][0].item()
 
