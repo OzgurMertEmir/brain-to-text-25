@@ -14,7 +14,7 @@ This directory contains code and resources for training the brain-to-text RNN mo
 ### Update Train Scripts to Allow Distributed Training!!
 - WARNING: EXPERIMENTAL! This script may not be optimal and might not give expected loss reduction in mentioned number of epochs. Use this with caution, to disable distributed training and switch back to default, set distributed to false in `args.yaml`.
 ### Update Train Scripts to Allow Beam Search Decoding!!
-- WARNING: EXPERIMENTAL! to enable beam search decoding, set `use_beam_search` to true in `args.yaml`.
+- WARNING: EXPERIMENTAL! to enable beam search decoding, set `use_beam_search` to true in `args.yaml`. (Beam Search slows down training procedure for obvious reasons at validation steps)
 
 ## Execute Training
 ```sh
