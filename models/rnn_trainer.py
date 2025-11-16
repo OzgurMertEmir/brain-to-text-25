@@ -22,6 +22,9 @@ from ctc_beam_search import CTCBeamSearchDecoder
 
 from data_augmentations import gauss_smooth
 from dataset import BrainToTextDataset, train_test_split_indicies
+from utils.general_utils import aggregate_batch_confidence_metrics, aggregate_phoneme_metrics, \
+    compute_confidence_metrics_for_sample, compute_phoneme_metrics, \
+    compute_word_char_error
 
 # Configure TF32 using the new API (avoids deprecation warnings in PyTorch 2.9+)
 torch.backends.cudnn.conv.fp32_precision = 'tf32'  # TF32 for cuDNN convolution operations
@@ -60,10 +63,11 @@ class RNNTrainer:
             sh = logging.StreamHandler(sys.stdout)
             sh.setFormatter(formatter)
             self.logger.addHandler(sh)
-
+        
         ## Setup Training Device
         if self.is_distributed:
-            dist.init_process_group(backend='nccl', init_method = self.args['dist_url'], world_size=self.args['world_size'], rank = self.rank)
+            dist.init_process_group(backend='nccl', init_method=self.args['dist_url'],
+                                    world_size=self.args['world_size'], rank=self.rank)
             self.device = torch.device(f"cuda:{self.rank}")
             torch.cuda.set_device(self.rank)
             self.logger.info(f"Initialized distributed training on rank {self.rank}")
@@ -74,12 +78,12 @@ class RNNTrainer:
             except ValueError:
                 self.logger.warning(f"Invalid gpu_number value: {gpu_num}. Using 0 instead.")
                 gpu_num = 0
-
+            
             max_gpu_index = torch.cuda.device_count() - 1
             if gpu_num > max_gpu_index:
                 self.logger.warning(f"Requested GPU {gpu_num} not available. Using GPU 0 instead.")
                 gpu_num = 0
-
+            
             try:
                 self.device = torch.device(f"cuda:{gpu_num}")
                 test_tensor = torch.tensor([1.0]).to(self.device)
@@ -88,9 +92,21 @@ class RNNTrainer:
                 self.logger.error(f"Error initializing CUDA device {gpu_num}: {str(e)}")
                 self.logger.info("Falling back to CPU")
                 self.device = torch.device("cpu")
+        
+        elif torch.backends.mps.is_available() and torch.backends.mps.is_built():
+            # MPS only reachable if no CUDA
+            try:
+                self.device = torch.device("mps")
+                _ = torch.tensor([1.0]).to(self.device)  # test Apple M1/M2/M3 GPU
+            except Exception as e:
+                self.logger.error(f"Error initializing MPS device: {str(e)}")
+                self.logger.info("Falling back to CPU")
+                self.device = torch.device("cpu")
+        
         else:
+            # Absolute fallback
             self.device = torch.device("cpu")
-
+        
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f'Using device: {self.device}')
         
@@ -119,12 +135,14 @@ class RNNTrainer:
             bidirectional = self.args['model']['bidirectional']
         )
         self.model.to(self.device)
-        if not self.is_distributed or self.rank == 0: self.logger.info("Using torch.compile")
+        if not self.device == torch.device("mps"):
+            if not self.is_distributed or self.rank == 0:
+                self.logger.info("Using torch.compile")
+                self.model = torch.compile(self.model)
         
-        self.model = torch.compile(self.model)
         if self.is_distributed:
-            self.model = DDP(self.model, device_ids = [self.rank], find_unused_parameters=True)
-
+            self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
+        
         if not self.is_distributed or self.rank == 0:
             self.logger.info(f"Initialized RNN decoding model")
             self.logger.info(self.model)
@@ -438,7 +456,10 @@ class RNNTrainer:
             'losses': [],
             'block_nums': [],
             'trial_nums': [],
-            'day_indicies': []
+            'day_indicies': [],
+            # NEW
+            'confidence_samples': [],
+            'confidence_batches': []
         }
 
         if return_logits:
@@ -476,13 +497,25 @@ class RNNTrainer:
                     adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
 
                     logits = self.model(features, day_indicies)
-
-                    loss = self.ctc_loss(
-                        torch.permute(logits.log_softmax(2), [1, 0, 2]),
-                        labels,
-                        adjusted_lens,
-                        phone_seq_lens,
-                    )
+                    
+                    # Try CUDA/MPS direct CTC loss first
+                    try:
+                        loss = self.ctc_loss(
+                            log_probs=torch.permute(logits.log_softmax(2), (1, 0, 2)),
+                            targets=labels,
+                            input_lengths=adjusted_lens,
+                            target_lengths=phone_seq_lens
+                        )
+                    except Exception:
+                        # Fallback for MPS
+                        logits_cpu = logits.detach().cpu().requires_grad_()
+                        loss = self.ctc_loss(
+                            log_probs=torch.permute(logits_cpu.log_softmax(2), (1, 0, 2)),
+                            targets=labels.cpu(),
+                            input_lengths=adjusted_lens.cpu(),
+                            target_lengths=phone_seq_lens.cpu()
+                        )
+                    
                     loss = torch.mean(loss)
 
                 metrics['losses'].append(loss.cpu().detach().numpy())
@@ -504,6 +537,9 @@ class RNNTrainer:
 
                         batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
                         decoded_seqs.append(decoded_seq)
+                    # Beam search does NOT produce per-time-step logits,
+                    # so we do NOT compute confidence metrics here.
+                    sample_conf_metrics = None
                 else:
                     # Greedy decoding
                     for iterIdx in range(logits.shape[0]):
@@ -519,6 +555,21 @@ class RNNTrainer:
                         batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
 
                         decoded_seqs.append(decoded_seq)
+                        
+                        # --------------------------------------------
+                        # NEW: phoneme confidence metrics (only greedy)
+                        # --------------------------------------------
+                        if self.args['metrics']['activation']:
+                            logits_i = logits[iterIdx, :adjusted_lens[iterIdx], :].detach()
+                            conf_m = compute_confidence_metrics_for_sample(
+                                logits_tensor=logits_i,
+                                adjusted_len=int(adjusted_lens[iterIdx].item()),
+                                true_phonemes=trueSeq,
+                                blank_id=0
+                            )
+                            sample_conf_metrics.append(conf_m)  # Only greedy supports it
+                        else:
+                            sample_conf_metrics = None
 
             day = batch['day_indicies'][0].item()
 
@@ -640,14 +691,29 @@ class RNNTrainer:
                 # As we squash time steps into windows during model forward pass
                 adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
                 logits = self.model(features, day_indices)
-                loss = self.ctc_loss(
-                    log_probs = torch.permute(logits.log_softmax(2), (1, 0, 2)), # expected input dimension (T, N, S)
-                    targets = labels,
-                    input_lengths = adjusted_lens,
-                    target_lengths = phone_seq_lens
-                )
-
-                loss = torch.mean(loss)
+                try:
+                    loss = self.ctc_loss(
+                        log_probs=torch.permute(logits.log_softmax(2), (1, 0, 2)),  # expected input dimension (T, N, S)
+                        targets=labels,
+                        input_lengths=adjusted_lens,
+                        target_lengths=phone_seq_lens
+                    )
+                except Exception as e:
+                    # not supported for MPS
+                    logits_cpu = logits.detach().cpu().requires_grad_()
+                    
+                    log_probs_cpu = torch.permute(
+                        logits_cpu.log_softmax(2), (1, 0, 2)
+                    )
+                    
+                    loss = self.ctc_loss(
+                        log_probs=log_probs_cpu,
+                        targets=labels.cpu(),
+                        input_lengths=adjusted_lens.cpu(),
+                        target_lengths=phone_seq_lens.cpu()
+                    )
+            
+            loss = torch.mean(loss)
             
             loss.backward()
 

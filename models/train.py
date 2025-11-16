@@ -4,6 +4,7 @@ from omegaconf import OmegaConf
 from rnn_trainer import RNNTrainer
 import os
 
+
 def main_worker(rank, args):
     """
     Main worker function for distributed training.
@@ -11,9 +12,10 @@ def main_worker(rank, args):
     trainer = RNNTrainer(args, rank)
     trainer.train()
 
+
 if __name__ == '__main__':
     args = OmegaConf.load('args.yaml')
-
+    
     if args.distributed:
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
