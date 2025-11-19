@@ -10,24 +10,33 @@ if [[ ! -f "setup_lm.sh" ]]; then
   exit 1
 fi
 
-# 2. Install Miniconda (if not already present)
+# 2. Find or install conda
 MINICONDA_DIR="$HOME/miniconda3"
+ANACONDA_DIR="$HOME/anaconda3"
+CONDA_DIR=""
+
 if [[ -d "$MINICONDA_DIR" ]]; then
   echo "[info] Miniconda already installed at $MINICONDA_DIR"
+  CONDA_DIR="$MINICONDA_DIR"
+elif [[ -d "$ANACONDA_DIR" ]]; then
+  echo "[info] Anaconda installation detected at $ANACONDA_DIR (skipping Miniconda install)"
+  CONDA_DIR="$ANACONDA_DIR"
 else
-  echo "[info] Installing Miniconda under $MINICONDA_DIR ..."
+  CONDA_DIR="$MINICONDA_DIR"
+  echo "[info] Installing Miniconda under $CONDA_DIR ..."
   wget -O Miniconda3-latest-Linux-x86_64.sh \
     https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 
   # -b: batch (no prompts), -p: install location
-  bash ./Miniconda3-latest-Linux-x86_64.sh -b -p "$MINICONDA_DIR"
+  bash ./Miniconda3-latest-Linux-x86_64.sh -b -p "$CONDA_DIR"
   rm -f Miniconda3-latest-Linux-x86_64.sh
   echo "[info] Miniconda installed."
 fi
 
 # 3. Initialize conda for this shell
-echo "[info] Initializing conda ..."
-source ~/miniconda3/etc/profile.d/conda.sh
+echo "[info] Initializing conda from $CONDA_DIR ..."
+# shellcheck disable=SC1091
+source "$CONDA_DIR/etc/profile.d/conda.sh"
 
 # 4. Accept Anaconda Terms of Service for the required channels
 #    This avoids CondaToSNonInteractiveError during setup_lm.sh
