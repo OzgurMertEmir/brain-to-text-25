@@ -39,6 +39,13 @@ class NgramDecoderWrapper:
         if not os.path.exists(words_path):
             raise FileNotFoundError(f"words.txt not found at {words_path}")
 
+        if not os.path.exists(rescore_G_path):
+            rescore_G_path = ""
+            G_path = ""
+            self.can_rescore = False
+        else:
+            self.can_rescore = True
+
         decode_opts = lm_decoder.DecodeOptions(
             max_active,
             min_active,
@@ -104,8 +111,10 @@ class NgramDecoderWrapper:
             blank_penalty_log
         )
 
+        self.decoder.FinishDecoding()
+
         # Optional unpruned G rescoring
-        if do_rescore:
+        if do_rescore and self.can_rescore:
             try:
                 self.decoder.Rescore()
             except Exception:

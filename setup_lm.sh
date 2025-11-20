@@ -122,7 +122,8 @@ pip install \
     bitsandbytes==0.41.1 \
     pandas==2.3.3 \
     editdistance==0.8.1 \
-    h5py==3.14.0 
+    h5py==3.14.0 \
+    hf_transfer==0.1.9
 
 # cd to the language model directory and install the language model
 cd language_model/runtime/server/x86

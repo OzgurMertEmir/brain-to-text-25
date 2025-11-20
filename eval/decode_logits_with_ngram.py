@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "language_model"))
 
 from language_model.inprocess_decoder import NgramDecoderWrapper
+from language_model.llm_scorer import LLMSequentialScorer
 
 
 def rearrange_speech_logits_pt(logits: np.ndarray) -> np.ndarray:
@@ -50,6 +51,8 @@ def parse_args():
     p.add_argument("--eval-type", default="test", choices=["val", "test"],
                    help="If 'val', compute WER against stored true_sentence.")
     p.add_argument("--out-csv", default=None, help="Output CSV file for predicted sentences.")
+    p.add_argument("--llm-rescorer-model", default="gpt2", help="LLM model for rescoring the top-n decoded sentences.")
+    p.add_argument("--llm-rescore", default="True", help="For deciding if to do LLM rescoring on the top-n decoded sentences.")
     return p.parse_args()
 
 
@@ -73,9 +76,16 @@ def main():
         acoustic_scale=0.325,
         beam=17.0,
         lattice_beam=8.0,
-        nbest=50,
+        nbest=20,
     )
     print("[info] Decoder initialized.")
+
+    # LLM scorer for N-best
+    model = args.llm_rescorer_model
+    llm = LLMSequentialScorer(model_name=model)
+    alpha = 0.325   # acoustic weight
+    beta  = 1.0     # n-gram LM weight
+    gamma = 0.3     # LLM weight
 
     lm_results = {
         "session": [],
@@ -92,10 +102,28 @@ def main():
 
         # rearrange to [BLANK, SIL, phonemes...]
         logits_rearr = rearrange_speech_logits_pt(logits)  # [T, V]
-        best = dec.decode(logits_rearr,
+        nbest = dec.decode(logits_rearr,
                           blank_penalty=7.0,
-                          return_nbest=False,
-                          do_rescore=False)
+                          return_nbest=args.llm_rescore,
+                          do_rescore=True)
+
+        if args.llm_rescore:
+            if not nbest:
+                best_sentence = ""
+            else:
+                sentences = [s for (s, ac, lm) in nbest]
+                ac_scores = np.array([ac for (_, ac, _) in nbest], dtype=np.float32)
+                ng_scores = np.array([lm for (_, _, lm) in nbest], dtype=np.float32)
+    
+                # LLM log-prob of each sentence
+                llm_scores = np.array(llm.sentence_logprob(sentences), dtype=np.float32)
+    
+                # Combine scores: adjust alpha/beta/gamma as you like
+                total_scores = alpha * ac_scores + beta * ng_scores + gamma * llm_scores
+                best_ix = int(total_scores.argmax())
+                best_sentence = sentences[best_ix]
+        else:
+            best_sentence = nbest
 
         def _decode_if_bytes(x):
             return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
@@ -104,7 +132,7 @@ def main():
         lm_results["block"].append(int(block_all[i]))
         lm_results["trial"].append(int(trial_all[i]))
         lm_results["true_sentence"].append(_decode_if_bytes(true_all[i]))
-        lm_results["pred_sentence"].append(best)
+        lm_results["pred_sentence"].append(best_sentence)
 
     # If val, compute WER
     if args.eval_type == "val":
