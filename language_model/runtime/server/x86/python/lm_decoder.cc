@@ -4,6 +4,7 @@
 #include "torch/script.h"
 
 #include "decoder/brain_speech_decoder.h"
+#include "decoder/lattice_export.h"
 #include "utils/log.h"
 
 namespace py = pybind11;
@@ -60,6 +61,11 @@ PYBIND11_MODULE(lm_decoder, m) {
         .def_readonly("lm_score", &DecodeResult::lm_score)
         .def_readonly("sentence", &DecodeResult::sentence);
 
+    py::class_<LatticeExport>(m, "LatticeExport")
+        .def_readonly("start_state", &LatticeExport::start_state)
+        .def_readonly("arcs", &LatticeExport::arcs)
+        .def_readonly("finals", &LatticeExport::finals);
+
     py::class_<BrainSpeechDecoder>(m, "BrainSpeechDecoder")
         .def(py::init<std::shared_ptr<DecodeResource>, std::shared_ptr<DecodeOptions> >())
         .def("SetOpt", &BrainSpeechDecoder::SetOpt)
@@ -68,7 +74,11 @@ PYBIND11_MODULE(lm_decoder, m) {
         .def("Reset", &BrainSpeechDecoder::Reset)
         .def("FinishDecoding", &BrainSpeechDecoder::FinishDecoding)
         .def("DecodedSomething", &BrainSpeechDecoder::DecodedSomething)
-        .def("result", &BrainSpeechDecoder::result);
+        .def("result", &BrainSpeechDecoder::result)
+        .def("get_lattice", [](const BrainSpeechDecoder& decoder) {
+            const kaldi::Lattice& lat = decoder.Lattice();
+            return ExportLattice(lat);
+        });
 
     m.def("DecodeNumpy", &DecodeNumpy)
         .def("DecodeNumpyLogProbs", &DecodeNumpyLogProbs);

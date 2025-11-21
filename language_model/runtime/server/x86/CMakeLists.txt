@@ -150,6 +150,7 @@ add_library(decoder STATIC
   decoder/ctc_prefix_beam_search.cc
   decoder/ctc_wfst_beam_search.cc
   decoder/brain_speech_decoder.cc
+  decoder/lattice_export.cc
 )
 target_link_libraries(decoder PUBLIC ${TORCH_LIBRARIES} kaldi-decoder utils kaldi-fstext)
 

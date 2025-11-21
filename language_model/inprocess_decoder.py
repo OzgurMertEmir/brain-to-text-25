@@ -24,6 +24,7 @@ class NgramDecoderWrapper:
                  length_penalty: float = 0.0,
                  nbest: int = 100):
         self.lm_dir = lm_dir
+        self.acoustic_scale = acoustic_scale
 
         TLG_path        = os.path.join(lm_dir, "TLG.fst")
         words_path      = os.path.join(lm_dir, "words.txt")
@@ -132,3 +133,19 @@ class NgramDecoderWrapper:
             return out
         else:
             return out[0][0]  # best sentence only
+
+
+    def get_lattice(self):
+        """
+        Return the final WFST lattice for the *last* utterance that was decoded.
+        This is lm_decoder.LatticeExport from the C++ binding.
+        """
+        return self.decoder.get_lattice()
+
+    def print_lattice(self):
+        lat = self.get_lattice()
+        print(lat.start_state)
+        print(len(lat.arcs), "arcs")
+        print(len(lat.finals), "final states")
+        for arc in lat.arcs[:5]:
+            print(arc)

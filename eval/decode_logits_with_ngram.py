@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, argparse, time
+import os, sys, argparse
 from pathlib import Path
 
 import h5py
@@ -12,35 +12,9 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "language_model"))
 
 from language_model.inprocess_decoder import NgramDecoderWrapper
-from language_model.llm_scorer import LLMSequentialScorer
-
-
-def rearrange_speech_logits_pt(logits: np.ndarray) -> np.ndarray:
-    """
-    Original order: [BLANK, phonemes..., SIL]
-    Target order:   [BLANK, SIL, phonemes...]
-    logits: [1, T, V] or [T, V] depending on caller
-    """
-    if logits.ndim == 3:
-        # [1, T, V]
-        return np.concatenate((logits[:, :, 0:1], logits[:, :, -1:], logits[:, :, 1:-1]), axis=-1)
-    elif logits.ndim == 2:
-        # [T, V]
-        return np.concatenate((logits[:, 0:1], logits[:, -1:], logits[:, 1:-1]), axis=-1)
-    else:
-        raise ValueError(f"Unexpected logits shape for rearrange: {logits.shape}")
-
-
-def remove_punctuation(sentence: str) -> str:
-    import re
-    sentence = re.sub(r"[^a-zA-Z\- ']", "", sentence)
-    sentence = sentence.replace("- ", " ").lower()
-    sentence = sentence.replace("--", "").lower()
-    sentence = sentence.replace(" '", "'").lower()
-    sentence = sentence.strip()
-    sentence = " ".join([w for w in sentence.split() if w])
-    return sentence
-
+from llm_scorer import LLMSequentialScorer
+from decode_utils import rearrange_speech_logits_pt, remove_punctuation
+from lattice_utils import load_word_symbol_table, llm_lattice_rescore
 
 def parse_args():
     p = argparse.ArgumentParser("Decode HDF5 logits with n-gram LM")
@@ -48,11 +22,30 @@ def parse_args():
                    help="Directory containing TLG.fst, words.txt, etc.")
     p.add_argument("--lm-inputs-h5", default="eval/logits_for_lm.h5",
                    help="HDF5 file produced by get_logits_for_lm.py")
-    p.add_argument("--eval-type", default="test", choices=["val", "test"],
+    p.add_argument("--eval-type", default="val", choices=["val", "test"],
                    help="If 'val', compute WER against stored true_sentence.")
     p.add_argument("--out-csv", default=None, help="Output CSV file for predicted sentences.")
-    p.add_argument("--llm-rescorer-model", default="gpt2", help="LLM model for rescoring the top-n decoded sentences.")
-    p.add_argument("--llm-rescore", default="True", help="For deciding if to do LLM rescoring on the top-n decoded sentences.")
+    p.add_argument("--nbest", type=int, default=1, help="n for returning the top-n best sentences after decoding.")
+
+    # Sentence rescoring args
+    p.add_argument("--llm-rescorer-model", default="distilgpt2", help="LLM model for rescoring the top-n decoded sentences.")
+    p.add_argument("--llm-rescore", action="store_true", help="If set, rescore the top-n decoded sentences with an LLM.")
+    p.add_argument("--gamma-sentence", type=float, default=0.3,
+                   help="Weight for LLM score on sentence rescoring.")
+
+    # Lattice rescoring args
+    p.add_argument("--acoustic_scale", type=float, default=0.325)
+    p.add_argument("--alpha", type=float, default=0.325,
+                   help="Weight for acoustic score.")
+    p.add_argument("--beta", type=float, default=1.0,
+                   help="Weight for n-gram LM score.")
+    p.add_argument("--gamma-lattice", type=float, default=0.3,
+                   help="Weight for LLM score on lattice rescoring.")
+    p.add_argument("--use-lattice-llm", action="store_true",
+                   help="If set, generate N-best from lattice+LLM search instead of direct C++ N-best.")
+    p.add_argument("--lattice-llm-beam-size", type=int, default=8,
+                   help="Beam size for lattice+LLM search.")
+
     return p.parse_args()
 
 
@@ -71,21 +64,38 @@ def main():
     N, Tmax, V = logits_all.shape
     print(f"[info] N={N}, Tmax={Tmax}, V={V}")
 
+    return_nbest = args.nbest > 1
+    n = args.nbest
+    acoustic_scale = args.acoustic_scale
+    
     dec = NgramDecoderWrapper(
         lm_dir=args.lm_dir,
-        acoustic_scale=0.325,
+        acoustic_scale=acoustic_scale,
         beam=17.0,
         lattice_beam=8.0,
-        nbest=20,
+        nbest=n,
     )
     print("[info] Decoder initialized.")
 
     # LLM scorer for N-best
     model = args.llm_rescorer_model
     llm = LLMSequentialScorer(model_name=model)
-    alpha = 0.325   # acoustic weight
-    beta  = 1.0     # n-gram LM weight
-    gamma = 0.3     # LLM weight
+    alpha = args.alpha
+    beta  = args.beta
+    gamma_lattice  = args.gamma_lattice
+    gamma_sentence = args.gamma_sentence
+    
+    do_rescore = args.llm_rescore
+    use_lattice_llm = args.use_lattice_llm
+    do_rescore_cpp = not use_lattice_llm
+    
+
+    if use_lattice_llm:
+        words_txt = os.path.join(args.lm_dir, "words.txt")
+        id2word = load_word_symbol_table(words_txt)
+        print(f"[info] Loaded {len(id2word)} entries from {words_txt}")
+    else:
+        id2word = None
 
     lm_results = {
         "session": [],
@@ -104,26 +114,54 @@ def main():
         logits_rearr = rearrange_speech_logits_pt(logits)  # [T, V]
         nbest = dec.decode(logits_rearr,
                           blank_penalty=7.0,
-                          return_nbest=args.llm_rescore,
-                          do_rescore=True)
+                          return_nbest=return_nbest,
+                          do_rescore=do_rescore_cpp)
 
-        if args.llm_rescore:
+        if use_lattice_llm:
+            lat = dec.get_lattice()
+
+            # Lattice+LLM search returns list[(sent, ac, lm, llm_search)]
+            lattice_nbest = llm_lattice_rescore(
+                lat=lat,
+                id2word=id2word,
+                llm_scorer=llm,
+                acoustic_scale=acoustic_scale,
+                alpha=alpha,
+                beta=beta,
+                gamma=gamma_lattice,
+                beam_size=args.lattice_llm_beam_size,
+                nbest=n,
+            )
+
+            # Strip search-time llm_score; we’ll optionally recompute with LLM
+            nbest = [(s, ac, lm) for (s, ac, lm, llm_search) in lattice_nbest]
+
+            if not return_nbest:
+                if len(nbest) > 0:
+                    nbest = nbest[0][0]
+                else:
+                    nbest = None
+
+        if not return_nbest:
             if not nbest:
                 best_sentence = ""
-            else:
-                sentences = [s for (s, ac, lm) in nbest]
-                ac_scores = np.array([ac for (_, ac, _) in nbest], dtype=np.float32)
-                ng_scores = np.array([lm for (_, _, lm) in nbest], dtype=np.float32)
-    
-                # LLM log-prob of each sentence
-                llm_scores = np.array(llm.sentence_logprob(sentences), dtype=np.float32)
-    
-                # Combine scores: adjust alpha/beta/gamma as you like
-                total_scores = alpha * ac_scores + beta * ng_scores + gamma * llm_scores
-                best_ix = int(total_scores.argmax())
-                best_sentence = sentences[best_ix]
+            else: best_sentence = nbest
         else:
-            best_sentence = nbest
+            sentences = [s for (s, ac, lm) in nbest]
+            ac_scores = np.array([ac for (_, ac, _) in nbest], dtype=np.float32)
+            ng_scores = np.array([lm for (_, _, lm) in nbest], dtype=np.float32)
+
+            if do_rescore:
+                # Full-sentence LLM scoring *on top of* whichever search produced nbest
+                llm_scores = np.array(
+                    llm.sentence_logprob(sentences), dtype=np.float32
+                )
+                total_scores = alpha * ac_scores + beta * ng_scores + gamma_sentence * llm_scores
+                best_ix = int(total_scores.argmax())
+            else:
+                best_ix = 0
+
+            best_sentence = sentences[best_ix]
 
         def _decode_if_bytes(x):
             return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
@@ -151,7 +189,12 @@ def main():
 
     # Write predictions to CSV
     if args.out_csv is None:
-        out_path = Path(f"eval/sentence_predictions_{args.eval_type}.csv")
+        path = f"eval/sentence_predictions"
+        if use_lattice_llm:
+            path = path + "_lattice"
+        if do_rescore:
+            path = path + f"_top-{n}_best"
+        out_path = Path(f"{path}_{args.eval_type}.csv")
     else:
         out_path = Path(args.out_csv)
 

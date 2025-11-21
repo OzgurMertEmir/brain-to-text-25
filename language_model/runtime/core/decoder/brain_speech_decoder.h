@@ -122,6 +122,9 @@ class BrainSpeechDecoder {
   }
 
   const std::vector<DecodeResult>& result() const { return result_; }
+  const kaldi::Lattice& Lattice() const {
+    return searcher_->Lattice();
+  }
 
  private:
   void UpdateResult();
