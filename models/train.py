@@ -14,7 +14,7 @@ def main_worker(rank, args):
 
 
 if __name__ == '__main__':
-    args = OmegaConf.load('args.yaml')
+    args = OmegaConf.load('args_metrics.yaml')
     
     if args.distributed:
         os.environ['MASTER_ADDR'] = 'localhost'

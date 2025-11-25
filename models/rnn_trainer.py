@@ -457,9 +457,7 @@ class RNNTrainer:
             'block_nums': [],
             'trial_nums': [],
             'day_indicies': [],
-            # NEW
-            'confidence_samples': [],
-            'confidence_batches': []
+            'confidence_metrics': [],
         }
 
         if return_logits:
@@ -522,54 +520,45 @@ class RNNTrainer:
 
                 batch_edit_distance = 0
                 decoded_seqs = []
+                sample_conf_metrics = []
 
                 # Decode sequences (greedy or beam search)
                 if self.use_beam_search:
                     # Beam search decoding - use parallel processing for large batches
                     use_parallel = logits.shape[0] >= 8  # Enable for batches of 8+
-                    decoded_seqs_batch = self.beam_search_decoder.decode_batch(logits, adjusted_lens, parallel=use_parallel)
-
-                    for iterIdx in range(logits.shape[0]):
-                        decoded_seq = decoded_seqs_batch[iterIdx]
-                        trueSeq = np.array(
-                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
-                        )
-
-                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
-                        decoded_seqs.append(decoded_seq)
-                    # Beam search does NOT produce per-time-step logits,
-                    # so we do NOT compute confidence metrics here.
-                    sample_conf_metrics = None
+                    decoded_seqs = self.beam_search_decoder.decode_batch(logits, adjusted_lens, parallel=use_parallel)
+                    
                 else:
-                    # Greedy decoding
+                    # Greedy decoding, done sequentially for batch
                     for iterIdx in range(logits.shape[0]):
                         decoded_seq = torch.argmax(logits[iterIdx, 0 : adjusted_lens[iterIdx], :], dim=-1)
                         decoded_seq = torch.unique_consecutive(decoded_seq, dim=-1)
                         decoded_seq = decoded_seq.cpu().detach().numpy()
                         decoded_seq = np.array([i for i in decoded_seq if i != 0])
-
-                        trueSeq = np.array(
-                            labels[iterIdx][0 : phone_seq_lens[iterIdx]].cpu().detach()
-                        )
-
-                        batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
-
                         decoded_seqs.append(decoded_seq)
                         
-                        # --------------------------------------------
-                        # NEW: phoneme confidence metrics (only greedy)
-                        # --------------------------------------------
-                        if self.args['metrics']['activation']:
-                            logits_i = logits[iterIdx, :adjusted_lens[iterIdx], :].detach()
-                            conf_m = compute_confidence_metrics_for_sample(
-                                logits_tensor=logits_i,
-                                adjusted_len=int(adjusted_lens[iterIdx].item()),
-                                true_phonemes=trueSeq,
-                                blank_id=0
-                            )
-                            sample_conf_metrics.append(conf_m)  # Only greedy supports it
-                        else:
-                            sample_conf_metrics = None
+                for iterIdx in range(logits.shape[0]):
+                    decoded_seq = decoded_seqs[iterIdx]
+                    trueSeq = np.array(
+                        labels[iterIdx][0: phone_seq_lens[iterIdx]].cpu().detach()
+                    )
+                    
+                    batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
+                    # --------------------------------------------
+                    # NEW: phoneme confidence metrics
+                    # --------------------------------------------
+                    if self.args['metrics']['activation']:
+                        logits_i = logits[iterIdx, :adjusted_lens[iterIdx], :].detach()
+                        conf_m = compute_confidence_metrics_for_sample(
+                            logits_tensor=logits_i,
+                            adjusted_len=int(adjusted_lens[iterIdx].item()),
+                            true_phonemes=trueSeq,
+                            blank_id=0,
+                            agg_method=self.args['metrics']['confidence']['agg_method']
+                        )
+                        sample_conf_metrics.append(conf_m)
+                    else:
+                        sample_conf_metrics = None
 
             day = batch['day_indicies'][0].item()
 
@@ -594,6 +583,7 @@ class RNNTrainer:
             metrics['block_nums'].append(batch['block_nums'].numpy())
             metrics['trial_nums'].append(batch['trial_nums'].numpy())
             metrics['day_indicies'].append(batch['day_indicies'].cpu().numpy())
+            metrics['confidence_metrics'].append(sample_conf_metrics)
 
         avg_PER = total_edit_distance / total_seq_len
 
