@@ -3,7 +3,8 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 
-LOG_PATH = "training_log"
+MODEL_CHECKPOINT_DIR = "trained_models/baseline_gru"
+LOG_PATH = f"{MODEL_CHECKPOINT_DIR}/training_log"
 INTERVAL = 2000            # show train_loss averaged every N global batches
 FS_ANN = 8                 # annotation fontsize
 
@@ -101,7 +102,6 @@ def average_train_right_closed(df_train, interval):
 
 def main():
     df_train, df_val = parse_log(LOG_PATH)
-
     # Build global batch indices independently for train and val (based on their own resets)
     df_train = make_global_batches(df_train)
     df_val   = make_global_batches(df_val)
@@ -134,6 +134,7 @@ def main():
     plt.legend()
     plt.tight_layout()
     plt.show()
+    plt.savefig(f'{MODEL_CHECKPOINT_DIR}/train_v_val_ctc_loss')
 
     # ======================= FIGURE 2: PER =======================
     if not df_val.empty:
@@ -151,6 +152,7 @@ def main():
         plt.legend()
         plt.tight_layout()
         plt.show()
+        plt.savefig(f'{MODEL_CHECKPOINT_DIR}/val_per_plot')
 
 if __name__ == "__main__":
     main()
