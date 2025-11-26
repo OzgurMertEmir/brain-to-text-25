@@ -21,3 +21,12 @@ This directory contains code and resources for training the brain-to-text RNN mo
 cd brain-to-text-25/models
 python train.py
 ```
+
+## Baseline Eval
+0. Setup: Make sure to be in the root with no environments active, then run `source setup_lm.sh`.
+1. Activate the `brain-to-text-25` environment with `source .venv/bin/activate`.
+2. Run `eval/get_logits_for_lm.py`
+3. Deactivate the `brain-to-text-25` environment with `deactivate`.
+4. Switch to the conda environment `b2txt25_lm` with `conda activate b2txt25_lm`.
+5. Run `python eval/decode_logits_with_ngram.py`.
+6. Predictions will be written in the eval folder.
