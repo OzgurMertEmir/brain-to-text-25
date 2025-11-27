@@ -55,7 +55,7 @@ class RNNDecoder(BaseDecoder):
         self.out = nn.Linear(self.hidden_state_dim * (2 if self.bidirectional else 1), self.num_phonemes)
         nn.init.xavier_uniform_(self.out.weight)
     
-    def forward(self, x, day_idx, states=None, return_state=False):
+    def forward(self, x, day_idx, states=None, return_state=False, return_embedding=False):
         x = super().forward(x, day_idx)
         
         if states is None:
@@ -70,4 +70,5 @@ class RNNDecoder(BaseDecoder):
         logits = self.out(output)
 
         if return_state: return logits, hidden_states
+        elif return_embedding: return logits, output
         return logits

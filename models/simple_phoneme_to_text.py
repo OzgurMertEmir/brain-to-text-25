@@ -6,16 +6,17 @@ to text sentences without requiring Redis or separate language model processes.
 """
 
 import numpy as np
-from typing import List, Tuple, Dict
+from typing import Any, List, Tuple, Dict
 import re
 from ctc_beam_search import CTCBeamSearchDecoder
-
+import torch
+from utils.general_utils import compute_ctc_collapsed_confidence, get_log_probs_from_logits
 
 # Phoneme mapping (from evaluate_model_helpers.py)
 LOGIT_TO_PHONEME = [
     'BLANK',
     'AA', 'AE', 'AH', 'AO', 'AW',
-    'AY', 'B',  'CH', 'D', 'DH',
+    'AY', 'B', 'CH', 'D', 'DH',
     'EH', 'ER', 'EY', 'F', 'G',
     'HH', 'IH', 'IY', 'JH', 'K',
     'L', 'M', 'N', 'NG', 'OW',
@@ -37,7 +38,7 @@ class SimplePhonemeToTextConverter:
 
     This is much simpler than the full Redis + standalone LM setup.
     """
-
+    
     def __init__(self, dictionary_path: str = None, use_ngrams: bool = False,
                  beam_width: int = 10, prune_threshold: float = -10.0,
                  verbose: bool = False, num_processes: int = None):
@@ -55,19 +56,20 @@ class SimplePhonemeToTextConverter:
         self.phoneme_to_words = {}
         self.word_frequencies = {}
         self.use_ngrams = use_ngrams
-
+        self.blank_id = 0
+        
         # Initialize the optimized CTC beam search decoder
         self.beam_decoder = CTCBeamSearchDecoder(
-            blank_id=0,  # BLANK is at index 0 in LOGIT_TO_PHONEME
+            blank_id=self.blank_id,  # BLANK is at index 0 in LOGIT_TO_PHONEME
             beam_width=beam_width,
             prune_threshold=prune_threshold,
             verbose=verbose,
             num_processes=num_processes
         )
-
+        
         if dictionary_path:
             self.load_dictionary(dictionary_path)
-
+    
     def load_dictionary(self, dict_path: str):
         """
         Load a phoneme-to-word dictionary.
@@ -77,96 +79,97 @@ class SimplePhonemeToTextConverter:
         WORLD W ER L D
         """
         print(f"Loading phoneme dictionary from {dict_path}...")
-
+        
         with open(dict_path, 'r') as f:
             for line in f:
                 line = line.strip()
-
+                
                 # Skip comments and empty lines
                 if not line or line.startswith(';;;'):
                     continue
-
+                
                 # Parse line
                 parts = line.split()
                 word = parts[0].lower()
-
+                
                 # Remove variant markers (e.g., "HELLO(2)" -> "HELLO")
                 word = re.sub(r'\(\d+\)', '', word)
-
+                
                 # Get phonemes
                 phonemes = tuple(parts[1:])  # Use tuple for hashing
-
+                
                 # Add to dictionary
                 if phonemes not in self.phoneme_to_words:
                     self.phoneme_to_words[phonemes] = []
                 self.phoneme_to_words[phonemes].append(word)
-
+        
         print(f"Loaded {len(self.phoneme_to_words)} phoneme sequences")
-
-    def decode_ctc_greedy(self, logits: np.ndarray) -> List[str]:
+    
+    def decode_ctc_greedy(self, logits: np.ndarray, confidence: bool = False) -> (
+            tuple[list[str], list[float]] | list[str]):
         """
         Decode logits using greedy CTC decoding.
 
         Args:
             logits: (T, num_classes) array of log probabilities
+            confidence: bool signaling if confidence is needed
 
         Returns:
             List of phoneme strings
         """
-        # Greedy argmax
-        pred_seq = np.argmax(logits, axis=-1)
-
-        # Remove blanks (index 0)
-        pred_seq = [int(p) for p in pred_seq if p != 0]
-
-        # Remove consecutive duplicates (CTC collapse)
-        pred_seq = [pred_seq[i] for i in range(len(pred_seq))
-                   if i == 0 or pred_seq[i] != pred_seq[i-1]]
-
-        # Convert to phoneme strings
-        phonemes = [LOGIT_TO_PHONEME[p] for p in pred_seq]
-
-        return phonemes
-
-    def decode_ctc_beam_search(self, logits: np.ndarray, beam_width: int = None) -> List[str]:
+        
+        log_probs = get_log_probs_from_logits(logits)
+        optimal_path = np.argmax(logits, axis=-1)
+        
+        collapsed_ids, collapsed_conf = compute_ctc_collapsed_confidence(log_probs, optimal_path,
+                                                                          blank_id=self.blank_id)
+        # ID -> phoneme string
+        phonemes = [LOGIT_TO_PHONEME[i] for i in collapsed_ids]
+        
+        if confidence:
+            return phonemes, collapsed_conf
+        else:
+            return phonemes
+    
+    def decode_ctc_beam_search(self, logits: np.ndarray, beam_width: int = None, confidence: bool = False) -> (
+        tuple[list[str], list[float]] | list[str]):
         """
         Decode logits using beam search CTC decoding with the optimized decoder.
 
         Args:
+            confidence: bool parameter if we need probabilities of decoded phonemes
             logits: (T, num_classes) array of log probabilities or raw logits
             beam_width: Number of beams to keep (overrides instance beam_width if provided)
 
         Returns:
             List of phoneme strings (best path)
         """
-        # Convert raw logits to log probabilities if needed
-        # Assuming logits are already log probabilities; if not, apply log_softmax
-        if logits.max() > 0:  # Likely raw logits
-            # Convert to log probabilities using softmax
-            logits_max = logits.max(axis=-1, keepdims=True)
-            exp_logits = np.exp(logits - logits_max)
-            log_probs = np.log(exp_logits / exp_logits.sum(axis=-1, keepdims=True))
-        else:
-            log_probs = logits
-
+        log_probs = get_log_probs_from_logits(logits)
         # Temporarily override beam width if provided
         original_beam_width = self.beam_decoder.beam_width
         if beam_width is not None:
             self.beam_decoder.beam_width = beam_width
-
+        
         try:
             # Use the optimized decoder
-            pred_seq = self.beam_decoder.decode_single(log_probs)
-
-            # Convert indices to phoneme strings
-            phonemes = [LOGIT_TO_PHONEME[int(p)] for p in pred_seq]
-
-            return phonemes
+            decoded_output = self.beam_decoder.decode_single(log_probs, confidence=confidence)
+            
+            if confidence:
+                pred_seq, collapsed_conf = decoded_output
+                # Convert indices to phoneme strings
+                phonemes = [LOGIT_TO_PHONEME[int(p)] for p in pred_seq]
+                return phonemes, collapsed_conf
+            else:
+                pred_seq = decoded_output
+                phonemes = [LOGIT_TO_PHONEME[int(p)] for p in pred_seq]
+                return phonemes
+            
         finally:
             # Restore original beam width
             if beam_width is not None:
                 self.beam_decoder.beam_width = original_beam_width
-
+    
+    
     def phonemes_to_words(self, phonemes: List[str], use_beam_search: bool = False) -> List[str]:
         """
         Convert phoneme sequence to word sequence.
@@ -180,11 +183,11 @@ class SimplePhonemeToTextConverter:
         """
         if not self.phoneme_to_words:
             raise ValueError("No dictionary loaded. Call load_dictionary() first.")
-
+        
         # Split by word boundaries (' | ')
         word_phoneme_sequences = []
         current_word_phonemes = []
-
+        
         for p in phonemes:
             if p == ' | ':
                 if current_word_phonemes:
@@ -192,34 +195,34 @@ class SimplePhonemeToTextConverter:
                     current_word_phonemes = []
             else:
                 current_word_phonemes.append(p)
-
+        
         # Add last word if exists
         if current_word_phonemes:
             word_phoneme_sequences.append(current_word_phonemes)
-
+        
         # Convert each phoneme sequence to a word
         words = []
         for phoneme_seq in word_phoneme_sequences:
             phoneme_tuple = tuple(phoneme_seq)
-
+            
             if phoneme_tuple in self.phoneme_to_words:
                 # Get matching words
                 matching_words = self.phoneme_to_words[phoneme_tuple]
-
+                
                 # Pick the most common one (or first one if no frequency data)
                 if self.word_frequencies:
                     word = max(matching_words,
-                              key=lambda w: self.word_frequencies.get(w, 0))
+                               key=lambda w: self.word_frequencies.get(w, 0))
                 else:
                     word = matching_words[0]
-
+                
                 words.append(word)
             else:
                 # Unknown phoneme sequence - just join phonemes
                 words.append('_'.join(phoneme_seq).lower())
-
+        
         return words
-
+    
     def phonemes_to_sentence(self, phonemes: List[str]) -> str:
         """
         Convert phoneme sequence to a sentence string.
@@ -233,15 +236,15 @@ class SimplePhonemeToTextConverter:
         if not self.phoneme_to_words:
             # If no dictionary, just return phonemes as-is
             return ' '.join(phonemes)
-
+        
         words = self.phonemes_to_words(phonemes)
         sentence = ' '.join(words)
-
+        
         return sentence
-
+    
     def logits_to_sentence(self, logits: np.ndarray,
-                          use_beam_search: bool = False,
-                          beam_width: int = 10) -> str:
+                           use_beam_search: bool = False,
+                           beam_width: int = 10) -> str:
         """
         End-to-end: logits → phonemes → sentence.
 
@@ -258,10 +261,10 @@ class SimplePhonemeToTextConverter:
             phonemes = self.decode_ctc_beam_search(logits, beam_width)
         else:
             phonemes = self.decode_ctc_greedy(logits)
-
+        
         # Step 2: Convert phonemes to sentence
         sentence = self.phonemes_to_sentence(phonemes)
-
+        
         return sentence
 
 
@@ -271,18 +274,18 @@ def example_usage():
     """
     # Create converter
     converter = SimplePhonemeToTextConverter()
-
+    
     # Example: manually create some fake logits
     T = 20  # time steps
     num_classes = len(LOGIT_TO_PHONEME)
-
+    
     # Random logits (in practice, these come from your RNN)
     logits = np.random.randn(T, num_classes)
-
+    
     # Decode to phonemes
     phonemes = converter.decode_ctc_greedy(logits)
     print(f"Phonemes: {phonemes}")
-
+    
     # If you have a dictionary, you can convert to words
     # converter.load_dictionary('path/to/cmudict.txt')
     # sentence = converter.phonemes_to_sentence(phonemes)
