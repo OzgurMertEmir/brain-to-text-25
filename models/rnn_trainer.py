@@ -22,9 +22,6 @@ from ctc_beam_search import CTCBeamSearchDecoder
 
 from data_augmentations import gauss_smooth
 from dataset import BrainToTextDataset, train_test_split_indicies
-from utils.general_utils import aggregate_batch_confidence_metrics, aggregate_phoneme_metrics, \
-    compute_confidence_metrics_for_sample, compute_phoneme_metrics, \
-    compute_word_char_error
 
 # Configure TF32 using the new API (avoids deprecation warnings in PyTorch 2.9+)
 torch.backends.cudnn.conv.fp32_precision = 'tf32'  # TF32 for cuDNN convolution operations
@@ -457,9 +454,6 @@ class RNNTrainer:
             'block_nums': [],
             'trial_nums': [],
             'day_indicies': [],
-            # NEW
-            'confidence_samples': [],
-            'confidence_batches': []
         }
 
         if return_logits:
@@ -537,8 +531,6 @@ class RNNTrainer:
 
                         batch_edit_distance += F.edit_distance(decoded_seq, trueSeq)
                         decoded_seqs.append(decoded_seq)
-                    # Beam search does NOT produce per-time-step logits,
-                    # so we do NOT compute confidence metrics here.
                     sample_conf_metrics = None
                 else:
                     # Greedy decoding
@@ -556,21 +548,8 @@ class RNNTrainer:
 
                         decoded_seqs.append(decoded_seq)
                         
-                        # --------------------------------------------
-                        # NEW: phoneme confidence metrics (only greedy)
-                        # --------------------------------------------
-                        if self.args['metrics']['activation']:
-                            logits_i = logits[iterIdx, :adjusted_lens[iterIdx], :].detach()
-                            conf_m = compute_confidence_metrics_for_sample(
-                                logits_tensor=logits_i,
-                                adjusted_len=int(adjusted_lens[iterIdx].item()),
-                                true_phonemes=trueSeq,
-                                blank_id=0
-                            )
-                            sample_conf_metrics.append(conf_m)  # Only greedy supports it
-                        else:
-                            sample_conf_metrics = None
-
+                        
+                        
             day = batch['day_indicies'][0].item()
 
             day_per[day]['total_edit_distance'] += batch_edit_distance
