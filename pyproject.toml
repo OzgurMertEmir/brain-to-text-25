@@ -9,13 +9,18 @@ url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
+lm-decoder = { path = "language_model/runtime/server/x86", editable = true, marker = "python_version < '3.10'" }
 torch = [
-  { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  # 1. CUDA 12.6 for main env only (Python >= 3.11, Linux or Windows)
+  { index = "pytorch-cu126", marker = "python_version >= '3.11' and (sys_platform == 'linux' or sys_platform == 'win32')" },
+  # 2. CPU for LM env only (Python < 3.10, all platforms)
+  { index = "pytorch-cpu", marker = "python_version < '3.10'" },
+  # 3. CPU for macOS when Python >= 3.10
+  { index = "pytorch-cpu", marker = "python_version >= '3.10' and sys_platform == 'darwin'" },
 ]
 torchaudio = [
   { index = "pytorch-cu126", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-  { index = "pytorch-cpu", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu",  marker = "sys_platform == 'darwin'" },
 ]
 
 [project]
@@ -23,21 +28,52 @@ name = "brain-to-text-25"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.11"
+
+# Allow both Python versions
+requires-python = ">=3.9"
+
 dependencies = [
-  "g2p-en>=2.1.0",
-  "h5py>=3.15.1",
-  "jupyter",
-  "jupyterlab",
-  "matplotlib>=3.10.7",
-  "numpy>=2.3.4",
-  "omegaconf>=2.3.0",
+  # ----------------------
+  # MAIN ENV (Python >= 3.11)
+  # ----------------------
+  "g2p-en>=2.1.0; python_version >= '3.11'",
+  "h5py>=3.15.1; python_version >= '3.11'",
+  "ipykernel>=7.1.0; python_version >= '3.11'",
+  "jupyter; python_version >= '3.11'",
+  "jupyterlab; python_version >= '3.11'",
+  "matplotlib>=3.10.7; python_version >= '3.11'",
+  "nltk>=3.9.2; python_version >= '3.11'",
+  "numpy>=2.3.4; python_version >= '3.11'",
+  "omegaconf>=2.3.0; python_version >= '3.11'",
+  "pandas>=2.3.3; python_version >= '3.11'",
+  "scipy>=1.16.3; python_version >= '3.11'",
+  "torch; python_version >= '3.11'",
+  "torchaudio>=2.9.0; python_version >= '3.11'",
+  "tqdm>=4.67.1; python_version >= '3.11'",
+  # ----------------------
+  # LM ENV (Python 3.9)
+  # ----------------------
+  "torch==1.13.1; python_version < '3.10'",
+  "redis==5.0.6; python_version < '3.10'",
+  "jupyter==1.1.1; python_version < '3.10'",
+  "numpy==1.24.4; python_version < '3.10'",
+  "matplotlib==3.9.0; python_version < '3.10'",
+  "scipy==1.11.1; python_version < '3.10'",
+  "scikit-learn==1.6.1; python_version < '3.10'",
+  "tqdm==4.66.4; python_version < '3.10'",
+  "g2p_en==2.1.0; python_version < '3.10'",
+  "omegaconf==2.3.0; python_version < '3.10'",
+  "huggingface-hub==0.23.4; python_version < '3.10'",
+  "transformers==4.40.0; python_version < '3.10'",
+  "tokenizers==0.19.1; python_version < '3.10'",
+  "accelerate==0.33.0; python_version < '3.10'",
+  "bitsandbytes==0.41.1; python_version < '3.10' and platform_system == 'Linux'",
+  "redis>=5.0.6",
+  "editdistance>=0.8.1",
+  "h5py>=3.14.0",
   "pandas>=2.3.3",
-  "scipy>=1.16.3",
-  "sklearn",
-  "torch",
-  "torchaudio>=2.9.0",
+  "lm-decoder; python_version < '3.10'",
 ]
 
 [tool.setuptools]
-  packages = ["utils", "models"]
+packages = ["utils", "models"]

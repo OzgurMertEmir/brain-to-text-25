@@ -24,9 +24,16 @@ python train.py
 
 ## Baseline Eval
 0. Setup: Make sure to be in the root with no environments active, then run `source setup_lm.sh`.
-1. Activate the `brain-to-text-25` environment with `source .venv/bin/activate`.
+1. Activate `.venv` environment with `source .venv/bin/activate`.
 2. Run `eval/get_logits_for_lm.py`
-3. Deactivate the `brain-to-text-25` environment with `deactivate`.
-4. Switch to the conda environment `b2txt25_lm` with `conda activate b2txt25_lm`.
+3. Deactivate the `.venv` environment with `deactivate`.
+4. Switch to the conda environment `.venv-lm` with `source .venv-lm/bin/activate`.
 5. Run `python eval/decode_logits_with_ngram.py`.
 6. Predictions will be written in the eval folder.
+7. Sample Commands:
+```sh
+source .venv/bin/activate
+python eval/get_logits_for_lm.py --model-path models/trained_models/baseline_lstm_bi --eval-type val
+source .venv-lm/bin/activate
+python eval/decode_logits_with_ngram.py --lm-dir language_model/pretrained_language_models/speech_5gram/lang_test --eval-type test --nbest 5 --llm-rescore --use-lattice-llm
+```

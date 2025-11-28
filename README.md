@@ -60,6 +60,7 @@ data/
 ```
 
 ## Quick Setup
+> All additional steps for properly building dependencies can be found in setup_envs.sh!
 
 1.  **Install uv:**
     - On macOS and Linux:
