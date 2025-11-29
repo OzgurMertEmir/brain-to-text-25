@@ -139,7 +139,6 @@ with tqdm(total=total_trials, desc="Predicting phoneme sequences", unit="trial")
         data["pred_phonemes"] = []
         data["pred_confidence"] = []
         data["pred_embeddings"] = []
-        data["greedy_labels"] = []
 
         for neural_input in data["neural_features"]:
             neural_input = torch.tensor(neural_input[None, ...], dtype=torch.bfloat16, device=DEVICE)
@@ -161,8 +160,7 @@ with tqdm(total=total_trials, desc="Predicting phoneme sequences", unit="trial")
             
             if validation_params["use_tsne"]:
                 data["pred_embeddings"].append(single_trial_output['embeddings'][0])
-                data["greedy_labels"].append(np.argmax(logits, axis=-1))
-            
+                
             pbar.update(1)
 
 
@@ -210,12 +208,12 @@ if validation_params["use_tsne"]:
     flat_embeds = []
     flat_labels = []
     
-    for emb_seq, lab_seq in zip(data["pred_embeddings"], data["greedy_labels"]):
+    for emb_seq, lab_seq in zip(data["pred_embeddings"], data["seq_class_ids"]):
         for e, l in zip(emb_seq, lab_seq):
             flat_embeds.append(e)  # shape (H,)
             flat_labels.append(l)  # scalar
             
-    print(f"Total TSNE points: {len(flat_labels)}")
+    print(f"Total TSNE points: {len(flat_labels), len(flat_embeds)}")
     plot_tSNE(flat_embeds, flat_labels, remove_blanks=True)
 
 
