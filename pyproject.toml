@@ -50,6 +50,10 @@ dependencies = [
   "torch; python_version >= '3.11'",
   "torchaudio>=2.9.0; python_version >= '3.11'",
   "tqdm>=4.67.1; python_version >= '3.11'",
+  "jiwer>=4.0.0; python_version >= '3.11'",
+  "transformers>=4.40.0; python_version >= '3.11'",
+  "accelerate>=0.33.0; python_version >= '3.11'",
+  "deepspeed>=0.18.2; python_version >= '3.11'",
   # ----------------------
   # LM ENV (Python 3.9)
   # ----------------------
@@ -72,7 +76,14 @@ dependencies = [
   "editdistance>=0.8.1",
   "h5py>=3.14.0",
   "pandas>=2.3.3",
+  "setuptools>=80.9.0",
   "lm-decoder; python_version < '3.10'",
+  "datasets>=3.2.0",
+  "spacy>=3.8.11",
+  "pip>=25.3",
+  "scikit-learn>=1.6.1",
+  "matplotlib>=3.9.0",
+  "seaborn>=0.13.2"
 ]
 
 [tool.setuptools]
