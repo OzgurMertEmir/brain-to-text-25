@@ -211,3 +211,4 @@ trained_models/
 .DS_Store
 
 *.csv
+*.parquet
