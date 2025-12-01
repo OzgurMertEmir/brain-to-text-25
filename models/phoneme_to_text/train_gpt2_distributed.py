@@ -124,6 +124,8 @@ def main():
                 progress_bar.update(1)
                 total_loss += loss.item()
                 global_step += 1
+
+                progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
                 
         # End of Epoch Validation
         avg_train_loss = total_loss / num_update_steps_per_epoch
