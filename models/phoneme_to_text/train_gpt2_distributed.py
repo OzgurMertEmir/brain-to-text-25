@@ -21,7 +21,22 @@ from models.phoneme_to_text.dataset import PhonemeTextDataset
 def main():
     # 1. Initialize Accelerator
     # This automatically detects FSDP, DDP, or Single GPU based on 'accelerate config'
-    accelerator = Accelerator(gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS)
+    accelerator = Accelerator(
+        gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
+        log_with='all',
+        project_dir="."
+    )
+    
+    if accelerator.is_main_process:
+        accelerator.init_trackers(
+            project_name="btt25_phTT", 
+            config={
+                "learning_rate": LEARNING_RATE,
+                "epochs": EPOCHS,
+                "batch_size": BATCH_SIZE,
+                "grad_accum_steps": GRAD_ACCUMULATION_STEPS
+            }
+        )
     
     # Set seed for reproducibility
     if accelerator.is_local_main_process:
@@ -125,6 +140,7 @@ def main():
                 total_loss += loss.item()
                 global_step += 1
 
+                accelerator.log({"train_loss": loss.item()}, step=global_step)
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
                 
         # End of Epoch Validation
@@ -148,6 +164,12 @@ def main():
                 val_steps += 1
         
         avg_val_loss = val_loss / val_steps
+
+        accelerator.log({
+            "val_loss": avg_val_loss,
+            "epoch": epoch
+        }, step=global_step)
+
         if accelerator.is_local_main_process:
             print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
             
@@ -164,6 +186,8 @@ def main():
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(save_dir)
                 print(f"Saved checkpoint to {save_dir}")
+
+    accelerator.end_training()
 
     if accelerator.is_local_main_process:
         print("Training Complete!")
