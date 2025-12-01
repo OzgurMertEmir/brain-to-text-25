@@ -3,7 +3,7 @@ import os
 import math
 from torch.utils.data import DataLoader
 from transformers import (
-    GPT2LMHeadModel, 
+    GPT2LMHeadModel,
     GPT2Tokenizer, 
     AdamW, 
     get_linear_schedule_with_warmup
@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 from config import (
     BATCH_SIZE, EPOCHS, LEARNING_RATE, 
     TRAIN_DATA_PATH, MODEL_SAVE_PATH,
-    PHONEME_TOKENS, SPECIAL_TOKENS, GRAD_ACCUMULATION_STEPS, SEED
+    PHONEME_TOKENS, SPECIAL_TOKENS, GRAD_ACCUMULATION_STEPS, SEED, LOG_PROJECT_NAME
 )
 from models.phoneme_to_text.dataset import PhonemeTextDataset
 
@@ -29,7 +29,7 @@ def main():
     
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name="btt25_phTT", 
+            project_name=LOG_PROJECT_NAME, 
             config={
                 "learning_rate": LEARNING_RATE,
                 "epochs": EPOCHS,

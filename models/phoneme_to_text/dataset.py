@@ -3,7 +3,7 @@ import pandas as pd
 from datasets import load_dataset, Dataset, DatasetDict, concatenate_datasets
 from transformers import PreTrainedTokenizer
 import numpy as np
-from models.phoneme_to_text.config import MAX_LENGTH, PHONEME_MAP
+from models.phoneme_to_text.config import MAX_LENGTH, PHONEME_MAP, DATA_AUGMENTATION
 from models.phoneme_to_text.phoneme_augmentor import PhonemeAugmentor
 
 class PhonemeTextDataset:
@@ -154,7 +154,7 @@ class PhonemeTextDataset:
                 "labels": torch.tensor(labels_batch, dtype=torch.long)
             }
         
-        dataset_dict['train'].set_transform(lambda x: transform_fn(x, augment=True))
+        dataset_dict['train'].set_transform(lambda x: transform_fn(x, augment=DATA_AUGMENTATION))
         if 'validation' in dataset_dict:
             dataset_dict['validation'].set_transform(lambda x: transform_fn(x, augment=False))
         if 'test' in dataset_dict:

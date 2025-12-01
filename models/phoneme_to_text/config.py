@@ -5,10 +5,13 @@ LEARNING_RATE = 5e-5
 EPOCHS = 3
 SEED = 42
 GRAD_ACCUMULATION_STEPS = 4
+DATA_AUGMENTATION = False
 
 # 2. File Paths
-MODEL_SAVE_PATH = "./phoneme_gpt2_ckpt"
+LOG_PATH = "./logs"
+MODEL_SAVE_PATH = "./checkpoints/phoneme_gpt2_clean_ckpt"
 TRAIN_DATA_PATH = "./data"
+LOG_PROJECT_NAME = "btt25_phTT_clean"
 
 # 4. The Tokenized Phoneme List (Namespace Protected)
 # Maps 'AA' -> '<p:AA>', ' | ' -> '<p:|>'
