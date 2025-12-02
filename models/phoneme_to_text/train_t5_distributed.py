@@ -3,18 +3,20 @@ import os
 import math
 from torch.utils.data import DataLoader
 from transformers import (
-    GPT2LMHeadModel,
-    GPT2Tokenizer, 
-    AdamW, 
+    T5ForConditionalGeneration,
+    T5Tokenizer,
+    AdamW,
     get_linear_schedule_with_warmup
 )
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 
 from config import (
-    BATCH_SIZE, EPOCHS, LEARNING_RATE, 
-    TRAIN_DATA_PATH, MODEL_SAVE_PATH,
-    PHONEME_TOKENS, SPECIAL_TOKENS, GRAD_ACCUMULATION_STEPS, SEED, LOG_PROJECT_NAME, LOG_PATH
+    EPOCHS, LEARNING_RATE,
+    TRAIN_DATA_PATH, MODEL_SAVE_PATH_T5, T5_MODEL_NAME,
+    PHONEME_TOKENS, LOG_PROJECT_NAME_T5, LOG_PATH,
+    T5_BATCH_SIZE, T5_GRAD_ACCUMULATION_STEPS, ENABLE_GRADIENT_CHECKPOINTING,
+    T5_WEIGHT_DECAY
 )
 from models.phoneme_to_text.dataset import PhonemeTextDataset
 
@@ -22,70 +24,74 @@ def main():
     # 1. Initialize Accelerator
     # This automatically detects FSDP, DDP, or Single GPU based on 'accelerate config'
     accelerator = Accelerator(
-        gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
+        gradient_accumulation_steps=T5_GRAD_ACCUMULATION_STEPS,
         log_with='all',
         project_dir=LOG_PATH
     )
-    
+
     if accelerator.is_main_process:
         accelerator.init_trackers(
-            project_name=LOG_PROJECT_NAME, 
+            project_name=LOG_PROJECT_NAME_T5,
             config={
                 "learning_rate": LEARNING_RATE,
                 "epochs": EPOCHS,
-                "batch_size": BATCH_SIZE,
-                "grad_accum_steps": GRAD_ACCUMULATION_STEPS
+                "batch_size": T5_BATCH_SIZE,
+                "grad_accum_steps": T5_GRAD_ACCUMULATION_STEPS,
+                "model": T5_MODEL_NAME
             }
         )
-    
+
     # Set seed for reproducibility
     if accelerator.is_local_main_process:
         print(f"Distributed Type: {accelerator.distributed_type}")
+        print(f"DeepSpeed Stage: {accelerator.deepspeed_plugin.zero_stage}")
         print(f"Mixed Precision: {accelerator.mixed_precision}")
-    
-    # 2. Tokenizer & Model Setup
-    # Load base
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
-    model = GPT2LMHeadModel.from_pretrained('gpt2')
+        print(f"Training T5 Model: {T5_MODEL_NAME}")
 
-    # Add Special Tokens (Functional + Phonemes)
+    # 2. Tokenizer & Model Setup
+    # Load base T5 model and tokenizer
+    tokenizer = T5Tokenizer.from_pretrained(T5_MODEL_NAME, legacy=False)
+    model = T5ForConditionalGeneration.from_pretrained(T5_MODEL_NAME)
+
+    # Enable gradient checkpointing to reduce memory usage
+    # This trades compute for memory - slower but fits larger models
+    if ENABLE_GRADIENT_CHECKPOINTING: model.gradient_checkpointing_enable()
+
+    # Add Phoneme Tokens as additional special tokens
+    # T5 already has pad_token and eos_token, so we just add phonemes
     tokenizer.add_special_tokens({
-        "pad_token": SPECIAL_TOKENS["pad_token"],
-        "sep_token": SPECIAL_TOKENS["sep_token"],
-        "bos_token": SPECIAL_TOKENS["bos_token"],
-        "eos_token": SPECIAL_TOKENS["eos_token"],
         "additional_special_tokens": PHONEME_TOKENS
     })
 
     # Resize embeddings to fit new phonemes
     model.resize_token_embeddings(len(tokenizer))
-    
+
     # 3. Data Preparation
     # Initialize our robust loader
     loader = PhonemeTextDataset(data_dir=TRAIN_DATA_PATH, tokenizer=tokenizer)
-    
+
     # Load (only on main process usually, but HF datasets handles caching with locks)
     with accelerator.main_process_first():
         raw_datasets = loader.load_and_prepare_datasets()
-        processed_datasets = loader.prepare_for_trainer_gpt2(raw_datasets)
+        processed_datasets = loader.prepare_for_trainer_t5(raw_datasets)
 
     # Create DataLoaders
     # Note: shuffle=True for train. Accelerate handles splitting this across GPUs automatically.
     train_loader = DataLoader(
-        processed_datasets['train'], 
-        batch_size=BATCH_SIZE, 
+        processed_datasets['train'],
+        batch_size=T5_BATCH_SIZE,
         shuffle=True,
         pin_memory=True
     )
     val_loader = DataLoader(
-        processed_datasets['validation'], 
-        batch_size=BATCH_SIZE, 
+        processed_datasets['validation'],
+        batch_size=T5_BATCH_SIZE,
         shuffle=False,
         pin_memory=True
     )
 
     # 4. Optimizer & Scheduler
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE)
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=T5_WEIGHT_DECAY)
 
     # 5. Prepare with Accelerator
     # This wraps model in FSDP/DDP wrapper, creates sharded optimizer, etc.
@@ -103,43 +109,37 @@ def main():
         num_training_steps=max_train_steps
     )
 
-    scheduler = get_linear_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=1000,
-        num_training_steps=max_train_steps
-    )
-
     # 6. Training Loop
     if accelerator.is_local_main_process:
         print("Starting training...")
 
     global_step = 0
-    
+
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
-        
+
         # Progress bar only on main process
         progress_bar = tqdm(
             range(num_update_steps_per_epoch),
             disable=not accelerator.is_main_process,
             desc=f"Epoch {epoch+1}"
         )
-        
+
         for step, batch in enumerate(train_loader):
             with accelerator.accumulate(model):
                 # Forward
                 outputs = model(**batch)
                 loss = outputs.loss
-                
+
                 # Backward (Accelerate handles scaling/unscaling)
                 accelerator.backward(loss)
-                
+
                 # Optimizer Step
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad()
-            
+
             # Logging
             if accelerator.sync_gradients:
                 progress_bar.update(1)
@@ -148,27 +148,27 @@ def main():
 
                 accelerator.log({"train_loss": loss.item()}, step=global_step)
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
-                
+
         # End of Epoch Validation
         avg_train_loss = total_loss / num_update_steps_per_epoch
         if accelerator.is_local_main_process:
             print(f"Epoch {epoch+1} Train Loss: {avg_train_loss:.4f}")
-        
+
         # Validation Loop
         model.eval()
         val_loss = 0
         val_steps = 0
-        
+
         for batch in val_loader:
             with torch.no_grad():
                 outputs = model(**batch)
-                
+
                 # Gather loss across all GPUs to get accurate metric
                 # (Optional for loss, crucial for accuracy)
                 losses = accelerator.gather(outputs.loss)
                 val_loss += losses.mean().item()
                 val_steps += 1
-        
+
         avg_val_loss = val_loss / val_steps
 
         accelerator.log({
@@ -178,15 +178,15 @@ def main():
 
         if accelerator.is_local_main_process:
             print(f"Epoch {epoch+1} Val Loss: {avg_val_loss:.4f}")
-            
+
             # Save Checkpoint
             # We must unwrap the model to save clean weights (removing FSDP wrappers)
             unwrapped_model = accelerator.unwrap_model(model)
-            save_dir = os.path.join(MODEL_SAVE_PATH, f"epoch_{epoch+1}")
-            
+            save_dir = os.path.join(MODEL_SAVE_PATH_T5, f"epoch_{epoch+1}")
+
             unwrapped_model.save_pretrained(
-                save_dir, 
-                is_main_process=accelerator.is_main_process, 
+                save_dir,
+                is_main_process=accelerator.is_main_process,
                 save_function=accelerator.save
             )
             if accelerator.is_main_process:
