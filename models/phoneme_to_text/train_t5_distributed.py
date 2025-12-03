@@ -63,9 +63,21 @@ def main():
         "additional_special_tokens": PHONEME_TOKENS
     })
 
+    # Sanity check: all phoneme tokens must resolve to non-UNK ids
+    phoneme_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in PHONEME_TOKENS]
+    unk_id = tokenizer.unk_token_id
+    bad_tokens = [t for t, tid in zip(PHONEME_TOKENS, phoneme_token_ids) if tid == unk_id]
+
+    if bad_tokens:
+        raise ValueError(
+            f"The following phoneme tokens map to UNK in the tokenizer: {bad_tokens}. "
+            "This will cause the encoder to ignore your phoneme inputs. "
+            "Check PHONEME_TOKENS / PHONEME_MAP and tokenizer.add_special_tokens."
+        )
+    
     # Resize embeddings to fit new phonemes
     model.resize_token_embeddings(len(tokenizer))
-
+    
     # 3. Data Preparation
     # Initialize our robust loader
     loader = PhonemeTextDataset(data_dir=TRAIN_DATA_PATH, tokenizer=tokenizer)
@@ -187,7 +199,8 @@ def main():
             unwrapped_model.save_pretrained(
                 save_dir,
                 is_main_process=accelerator.is_main_process,
-                save_function=accelerator.save
+                save_function=accelerator.save,
+                safe_serialization=True
             )
             if accelerator.is_main_process:
                 tokenizer.save_pretrained(save_dir)
