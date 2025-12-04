@@ -5,9 +5,10 @@ from torch.utils.data import DataLoader
 from transformers import (
     GPT2LMHeadModel,
     GPT2Tokenizer, 
-    AdamW, 
+    # AdamW, 
     get_linear_schedule_with_warmup
 )
+from deepspeed.ops.adam import FusedAdam as AdamW
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 

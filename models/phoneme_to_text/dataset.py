@@ -184,12 +184,12 @@ class PhonemeTextDataset:
                 if augment:
                     ph_seq = self.augmentor.augment(ph_seq)
                 
-                # Map phonemes to protected tokens, e.g. 'AA' -> '<p:AA>'
-                token_strs = [PHONEME_MAP.get(p, p) for p in ph_seq]
+                # # Map phonemes to protected tokens, e.g. 'AA' -> '<p:AA>'
+                # token_strs = [PHONEME_MAP.get(p, p) for p in ph_seq]
 
                 # Build T5-style source sequence with a task prefix
-                # Example: "transcribe phonemes to text: <p:DH> <p:AH> <p:|> ..."
-                src_text = TASK_PREFIX + " ".join(token_strs)
+                # Example: "transcribe phonemes to text: DH AH | ..."
+                src_text = TASK_PREFIX + " ".join(ph_seq)
 
                 # Encode source with T5 tokenizer (this is critical)
                 enc = self.tokenizer(

@@ -5,9 +5,10 @@ from torch.utils.data import DataLoader
 from transformers import (
     T5ForConditionalGeneration,
     T5Tokenizer,
-    AdamW,
+    # AdamW,
     get_linear_schedule_with_warmup
 )
+from deepspeed.ops.adam import FusedAdam as AdamW
 from accelerate import Accelerator
 from tqdm.auto import tqdm
 
@@ -16,7 +17,7 @@ from config import (
     TRAIN_DATA_PATH, MODEL_SAVE_PATH_T5, T5_MODEL_NAME,
     PHONEME_TOKENS, LOG_PROJECT_NAME_T5, LOG_PATH,
     T5_BATCH_SIZE, T5_GRAD_ACCUMULATION_STEPS, ENABLE_GRADIENT_CHECKPOINTING,
-    T5_WEIGHT_DECAY
+    T5_WEIGHT_DECAY, DATA_AUGMENTATION
 )
 from models.phoneme_to_text.dataset import PhonemeTextDataset
 
@@ -47,6 +48,7 @@ def main():
         print(f"DeepSpeed Stage: {accelerator.deepspeed_plugin.zero_stage}")
         print(f"Mixed Precision: {accelerator.mixed_precision}")
         print(f"Training T5 Model: {T5_MODEL_NAME}")
+        print(f"Data Augementation: {'ON' if DATA_AUGMENTATION else 'OFF'}")
 
     # 2. Tokenizer & Model Setup
     # Load base T5 model and tokenizer
@@ -57,26 +59,26 @@ def main():
     # This trades compute for memory - slower but fits larger models
     if ENABLE_GRADIENT_CHECKPOINTING: model.gradient_checkpointing_enable()
 
-    # Add Phoneme Tokens as additional special tokens
-    # T5 already has pad_token and eos_token, so we just add phonemes
-    tokenizer.add_special_tokens({
-        "additional_special_tokens": PHONEME_TOKENS
-    })
+    # # Add Phoneme Tokens as additional special tokens
+    # # T5 already has pad_token and eos_token, so we just add phonemes
+    # tokenizer.add_special_tokens({
+    #     "additional_special_tokens": PHONEME_TOKENS
+    # })
 
-    # Sanity check: all phoneme tokens must resolve to non-UNK ids
-    phoneme_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in PHONEME_TOKENS]
-    unk_id = tokenizer.unk_token_id
-    bad_tokens = [t for t, tid in zip(PHONEME_TOKENS, phoneme_token_ids) if tid == unk_id]
+    # # Sanity check: all phoneme tokens must resolve to non-UNK ids
+    # phoneme_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in PHONEME_TOKENS]
+    # unk_id = tokenizer.unk_token_id
+    # bad_tokens = [t for t, tid in zip(PHONEME_TOKENS, phoneme_token_ids) if tid == unk_id]
 
-    if bad_tokens:
-        raise ValueError(
-            f"The following phoneme tokens map to UNK in the tokenizer: {bad_tokens}. "
-            "This will cause the encoder to ignore your phoneme inputs. "
-            "Check PHONEME_TOKENS / PHONEME_MAP and tokenizer.add_special_tokens."
-        )
+    # if bad_tokens:
+    #     raise ValueError(
+    #         f"The following phoneme tokens map to UNK in the tokenizer: {bad_tokens}. "
+    #         "This will cause the encoder to ignore your phoneme inputs. "
+    #         "Check PHONEME_TOKENS / PHONEME_MAP and tokenizer.add_special_tokens."
+    #     )
     
-    # Resize embeddings to fit new phonemes
-    model.resize_token_embeddings(len(tokenizer))
+    # # Resize embeddings to fit new phonemes
+    # model.resize_token_embeddings(len(tokenizer))
     
     # 3. Data Preparation
     # Initialize our robust loader

@@ -1,0 +1,351 @@
+"""
+Acoustic-Aware RNN + T5 Evaluation Script
+
+This script implements N-best rescoring by combining:
+1. Acoustic scores from CTC beam search (RNN decoder confidence)
+2. Language model scores from a pretrained LLM (e.g., T5)
+"""
+
+import torch
+import os
+from omegaconf import OmegaConf
+from models.rnn_decoder import RNNDecoder
+
+from transformers import T5ForConditionalGeneration, T5Tokenizer
+
+import pandas as pd
+from utils.load_data import load_h5py_file
+from models.data_augmentations import gauss_smooth
+
+from tqdm import tqdm
+from models.simple_phoneme_to_text import SimplePhonemeToTextConverter
+from models.phoneme_to_text.t5_inference import generate_text_batch
+import numpy as np
+
+from eval.llm_scorer import LLMSequentialScorer
+
+# ===================================================================
+# CONFIGURATION
+# ===================================================================
+EVAL_TYPE = "val"  # "val" or "test"
+CSV_DESC_PATH = "../data/t15_copyTaskData_description.csv"
+DATA_DIR = "../data/hdf5_data_final"
+T5_CHECKPOINT_PATH = "./phoneme_to_text/checkpoints/phoneme_t5_base_ckpt/epoch_3"
+RNN_MODEL_NAME = "baseline_lstm_bi"
+RNN_MODEL_PATH = f"trained_models/{RNN_MODEL_NAME}"
+
+# N-best rescoring parameters
+NBEST = 50  # Number of hypotheses to consider
+BEAM_WIDTH = 100  # Beam width for CTC decoding (should be >= NBEST)
+
+# Scoring weights (tune these!)
+ALPHA = 1.0   # Weight for acoustic score
+GAMMA = 0.5   # Weight for LLM score
+
+# LLM scorer model (for rescoring generated text)
+LLM_RESCORER_MODEL = "distilgpt2"  # Model for scoring (can be different from T5 generator)
+
+# Other settings
+BATCH_SIZE = 8  # Batch size for processing
+STORE_NBEST_INFO = True  # Store N-best hypotheses and scores in CSV
+PREDICTIONS_PATH = f"phoneme_prediction_results_t5_acoustic_nbest{NBEST}_alpha{ALPHA}_gamma{GAMMA}.csv"
+
+# ===================================================================
+# SETUP
+# ===================================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+print(f"🖥️  Using device: {device}")
+
+model_args = OmegaConf.load(os.path.join(RNN_MODEL_PATH, "checkpoint/args.yaml"))
+
+# ===================================================================
+# Load Dataset
+# ===================================================================
+print(f"📀 Loading {EVAL_TYPE} Dataset....")
+desc_df = pd.read_csv(CSV_DESC_PATH)
+test_data = {}
+total_trials = 0
+
+# Flatten data into a list for batching
+all_neural_features = []
+all_session_indices = []
+all_true_sentences = []
+
+for session in model_args.dataset.sessions:
+    eval_file = os.path.join(DATA_DIR, session, f"data_{EVAL_TYPE}.hdf5")
+
+    if not os.path.exists(eval_file):
+        continue
+
+    data = load_h5py_file(eval_file, desc_df)
+    test_data[session] = data
+    trials = len(data["neural_features"])
+    total_trials += trials
+
+    session_idx = model_args.dataset.sessions.index(session)
+
+    for i in range(trials):
+        all_neural_features.append(data["neural_features"][i])
+        all_session_indices.append(session_idx)
+
+        # Store true sentences for val eval
+        if EVAL_TYPE == "val" and data["sentence_label"][i] is not None:
+            true_sentence = data["sentence_label"][i]
+            if isinstance(true_sentence, bytes):
+                true_sentence = true_sentence.decode('utf-8')
+            elif isinstance(true_sentence, np.ndarray):
+                true_sentence = true_sentence.item().decode('utf-8') if isinstance(true_sentence.item(), bytes) else str(true_sentence.item())
+            else:
+                true_sentence = str(true_sentence)
+            all_true_sentences.append(true_sentence)
+        else:
+            all_true_sentences.append(None)
+
+print(f"Total {EVAL_TYPE} trials loaded: {total_trials}\n")
+
+# ===================================================================
+# Load RNN Model
+# ===================================================================
+print(f"📀 Loading RNN Model from {RNN_MODEL_PATH}....")
+checkpoint = torch.load(
+    os.path.join(RNN_MODEL_PATH, "checkpoint/best_checkpoint"),
+    map_location=device,
+    weights_only=False
+)
+
+# Remove distributed prefixes
+state_dict = checkpoint["model_state_dict"]
+cleaned_state_dict = {}
+for k, v in state_dict.items():
+    new_k = k.replace("module.", "").replace("_orig_mod.", "")
+    cleaned_state_dict[new_k] = v
+
+rnn_model = RNNDecoder(
+    neuron_capture_tensor_dim=model_args.model.n_input_features,
+    hidden_state_dim=model_args.model.n_units,
+    num_days=len(model_args.dataset.sessions),
+    num_phonemes=model_args.dataset.n_classes,
+    rnn_type=model_args.model.rnn_type,
+    rnn_dropout=model_args.model.rnn_dropout,
+    input_dropout=model_args.model.input_network.input_layer_dropout,
+    num_rec_layers=model_args.model.n_layers,
+    ts_patch_size=model_args.model.patch_size,
+    ts_patch_stride=model_args.model.patch_stride,
+    bidirectional=model_args.model.bidirectional
+)
+
+rnn_model.load_state_dict(cleaned_state_dict)
+rnn_model.to(device).eval()
+
+# ===================================================================
+# Load T5 Model
+# ===================================================================
+print(f"📀 Loading T5 Model from {T5_CHECKPOINT_PATH}....")
+t5_tokenizer = T5Tokenizer.from_pretrained(T5_CHECKPOINT_PATH, legacy=False)
+t5_model = T5ForConditionalGeneration.from_pretrained(T5_CHECKPOINT_PATH).to(device)
+
+# ===================================================================
+# Load LLM Scorer
+# ===================================================================
+print(f"📀 Loading LLM Scorer ({LLM_RESCORER_MODEL})....")
+llm_scorer = LLMSequentialScorer(model_name=LLM_RESCORER_MODEL)
+
+# ===================================================================
+# Initialize CTC Decoder
+# ===================================================================
+print(f"🔧 Initializing CTC Decoder (beam_width={BEAM_WIDTH}, nbest={NBEST})....")
+converter = SimplePhonemeToTextConverter(
+    dictionary_path=None,
+    use_ngrams=False,
+    beam_width=BEAM_WIDTH
+)
+
+# ===================================================================
+# Define RNN Decoding Function
+# ===================================================================
+@torch.no_grad()
+def decode_batch(neural_batch, session_indices):
+    """
+    Run forward pass on a batch of trials with optional smoothing.
+
+    Args:
+        neural_batch: List of neural feature arrays
+        session_indices: List of session indices
+
+    Returns:
+        List of logits (numpy arrays)
+    """
+    batch_logits = []
+
+    with torch.autocast(device_type=str(device), enabled=model_args.use_amp, dtype=torch.bfloat16):
+        for i, (neural_input, session_idx) in enumerate(zip(neural_batch, session_indices)):
+            # Convert to tensor
+            x = torch.tensor(neural_input[None, ...], dtype=torch.bfloat16, device=device)
+
+            # Apply smoothing
+            x = gauss_smooth(
+                inputs=x,
+                device=device,
+                smooth_kernel_std=model_args.dataset.data_transforms.smooth_kernel_std,
+                smooth_kernel_size=model_args.dataset.data_transforms.smooth_kernel_size,
+                padding="valid",
+            )
+
+            # Forward pass
+            logits, _ = rnn_model(x=x, day_idx=torch.tensor([session_idx], device=device), states=None, return_state=True)
+            batch_logits.append(logits[0].float().cpu().numpy())
+
+    return batch_logits
+
+# ===================================================================
+# Run Prediction Pipeline with N-best Rescoring
+# ===================================================================
+print(f"⏳ Running Acoustic N-best Rescoring Pipeline....")
+print(f"   α (acoustic) = {ALPHA}, γ (LLM) = {GAMMA}")
+
+predictions = []
+nbest_info = []  # Store N-best details if requested
+
+num_batches = (total_trials + BATCH_SIZE - 1) // BATCH_SIZE
+
+with tqdm(total=total_trials, desc="Processing batches", unit="trial") as pbar:
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, total_trials)
+
+        # Get batch data
+        batch_neural = all_neural_features[start_idx:end_idx]
+        batch_sessions = all_session_indices[start_idx:end_idx]
+
+        # Step 1: RNN decoding (batched)
+        batch_logits = decode_batch(batch_neural, batch_sessions)
+
+        # Step 2: N-best CTC decoding with acoustic scores
+        for sample_idx, logits in enumerate(batch_logits):
+            global_idx = start_idx + sample_idx
+
+            # Get N-best phoneme hypotheses with acoustic scores
+            nbest_results = converter.decode_ctc_nbest(
+                logits,
+                nbest=NBEST,
+                beam_width=BEAM_WIDTH,
+                confidence=False  # We use total score, not per-phoneme confidence
+            )
+
+            # Extract phoneme sequences and acoustic scores
+            phoneme_sequences = []
+            acoustic_scores = []
+
+            for phonemes, acoustic_score, _ in nbest_results:
+                phoneme_sequences.append(phonemes)
+                acoustic_scores.append(acoustic_score)
+
+            acoustic_scores = np.array(acoustic_scores)
+
+            # Step 3: Generate text for each N-best hypothesis using T5
+            if len(phoneme_sequences) == 0:
+                # Edge case: no hypotheses (shouldn't happen, but handle gracefully)
+                predictions.append("")
+                if STORE_NBEST_INFO:
+                    nbest_info.append({
+                        "nbest_texts": [],
+                        "acoustic_scores": [],
+                        "llm_scores": [],
+                        "combined_scores": [],
+                        "best_rank": -1
+                    })
+                pbar.update(1)
+                continue
+
+            # Use T5 batch generation
+            generated_texts = generate_text_batch(
+                phoneme_sequences,
+                t5_model,
+                t5_tokenizer,
+                device
+            )
+
+            # Step 4: Score with LLM
+            llm_scores = np.array(llm_scorer.sentence_logprob(generated_texts))
+
+            # Step 5: Combine acoustic + LLM scores
+            combined_scores = ALPHA * acoustic_scores + GAMMA * llm_scores
+
+            # Step 6: Select best hypothesis
+            best_idx = int(np.argmax(combined_scores))
+            best_text = generated_texts[best_idx]
+
+            predictions.append(best_text)
+
+            # Store N-best info if requested
+            if STORE_NBEST_INFO:
+                nbest_info.append({
+                    "nbest_texts": generated_texts,
+                    "acoustic_scores": acoustic_scores.tolist(),
+                    "llm_scores": llm_scores.tolist(),
+                    "combined_scores": combined_scores.tolist(),
+                    "best_rank": best_idx
+                })
+
+            pbar.update(1)
+
+print(f"✅ Pipeline Complete....")
+
+# ===================================================================
+# Saving Predictions
+# ===================================================================
+print(f"📀 Saving Predictions....")
+
+# Build dataframe
+df_dict = {
+    "id": list(range(len(predictions))),
+}
+
+# Add true_sentence for val eval
+if EVAL_TYPE == "val":
+    df_dict["true_sentence"] = all_true_sentences
+
+# Add predictions
+df_dict["pred_sentence"] = predictions
+
+# Add N-best info if enabled
+if STORE_NBEST_INFO:
+    df_dict["best_rank"] = [info["best_rank"] for info in nbest_info]
+    df_dict["acoustic_score_best"] = [info["acoustic_scores"][info["best_rank"]] if info["best_rank"] >= 0 else 0.0 for info in nbest_info]
+    df_dict["llm_score_best"] = [info["llm_scores"][info["best_rank"]] if info["best_rank"] >= 0 else 0.0 for info in nbest_info]
+    df_dict["combined_score_best"] = [info["combined_scores"][info["best_rank"]] if info["best_rank"] >= 0 else 0.0 for info in nbest_info]
+
+    # Optionally store all N-best as JSON strings (for detailed analysis)
+    import json
+    df_dict["nbest_all"] = [json.dumps(info) for info in nbest_info]
+
+df = pd.DataFrame(df_dict)
+
+df.to_csv(PREDICTIONS_PATH, index=False)
+print(f"✅ Predictions saved to {PREDICTIONS_PATH}")
+
+# ===================================================================
+# Compute WER if validation set
+# ===================================================================
+if EVAL_TYPE == "val":
+    import editdistance
+    from eval.decode_utils import remove_punctuation
+
+    total_true_len = 0
+    total_ed = 0
+
+    for true, pred in zip(all_true_sentences, predictions):
+        if true is None:
+            continue
+
+        true_clean = remove_punctuation(true or "")
+        pred_clean = remove_punctuation(pred or "")
+        true_tokens = true_clean.split()
+        pred_tokens = pred_clean.split()
+        ed = editdistance.eval(true_tokens, pred_tokens)
+        total_true_len += len(true_tokens)
+        total_ed += ed
+
+    wer = 100.0 * total_ed / max(1, total_true_len)
+    print(f"\n📊 [METRICS] Word Error Rate: {wer:.2f}%")
+    print(f"   (α={ALPHA}, γ={GAMMA}, N-best={NBEST})")
