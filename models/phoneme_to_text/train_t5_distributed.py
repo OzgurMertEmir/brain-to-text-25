@@ -2,23 +2,24 @@ import torch
 import os
 import math
 from torch.utils.data import DataLoader
+from torch.optim import AdamW
 from transformers import (
     T5ForConditionalGeneration,
     T5Tokenizer,
-    AdamW,
     get_linear_schedule_with_warmup
 )
-from accelerate import Accelerator
+from accelerate import Accelerator, DistributedType
 from tqdm.auto import tqdm
 
 from config import (
-    EPOCHS, LEARNING_RATE,
+    EPOCHS, LEARNING_RATE, RAW_PHONEMES,
     TRAIN_DATA_PATH, MODEL_SAVE_PATH_T5, T5_MODEL_NAME,
-    PHONEME_TOKENS, LOG_PROJECT_NAME_T5, LOG_PATH,
-    T5_BATCH_SIZE, T5_GRAD_ACCUMULATION_STEPS, ENABLE_GRADIENT_CHECKPOINTING,
-    T5_WEIGHT_DECAY
+    LOG_PROJECT_NAME_T5, LOG_PATH, T5_BATCH_SIZE, 
+    T5_GRAD_ACCUMULATION_STEPS, ENABLE_GRADIENT_CHECKPOINTING,
+    T5_WEIGHT_DECAY, PHONEME_TYPE, PHONEME_ONLY_ENCODER
 )
 from models.phoneme_to_text.dataset import PhonemeTextDataset
+from models.phoneme_to_text.phoneme_utils.helpers import get_phoneme_tokens
 
 def main():
     # 1. Initialize Accelerator
@@ -59,14 +60,15 @@ def main():
 
     # Add Phoneme Tokens as additional special tokens
     # T5 already has pad_token and eos_token, so we just add phonemes
+    phoneme_tokens = get_phoneme_tokens(PHONEME_TYPE, RAW_PHONEMES)
     tokenizer.add_special_tokens({
-        "additional_special_tokens": PHONEME_TOKENS
+        "additional_special_tokens": phoneme_tokens
     })
 
     # Sanity check: all phoneme tokens must resolve to non-UNK ids
-    phoneme_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in PHONEME_TOKENS]
+    phoneme_token_ids = [tokenizer.convert_tokens_to_ids(t) for t in phoneme_tokens]
     unk_id = tokenizer.unk_token_id
-    bad_tokens = [t for t, tid in zip(PHONEME_TOKENS, phoneme_token_ids) if tid == unk_id]
+    bad_tokens = [t for t, tid in zip(phoneme_tokens, phoneme_token_ids) if tid == unk_id]
 
     if bad_tokens:
         raise ValueError(
@@ -80,12 +82,12 @@ def main():
     
     # 3. Data Preparation
     # Initialize our robust loader
-    loader = PhonemeTextDataset(data_dir=TRAIN_DATA_PATH, tokenizer=tokenizer)
+    loader = PhonemeTextDataset(data_dir=TRAIN_DATA_PATH, tokenizer=tokenizer, phoneme_unit_mode=PHONEME_TYPE)
 
     # Load (only on main process usually, but HF datasets handles caching with locks)
     with accelerator.main_process_first():
         raw_datasets = loader.load_and_prepare_datasets()
-        processed_datasets = loader.prepare_for_trainer_t5(raw_datasets)
+        processed_datasets = loader.prepare_for_trainer_t5(raw_datasets, PHONEME_ONLY_ENCODER)
 
     # Create DataLoaders
     # Note: shuffle=True for train. Accelerate handles splitting this across GPUs automatically.

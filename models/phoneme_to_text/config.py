@@ -6,6 +6,8 @@ EPOCHS = 3
 SEED = 42
 GRAD_ACCUMULATION_STEPS = 4
 DATA_AUGMENTATION = True
+PHONEME_TYPE = "diphone"
+PHONEME_ONLY_ENCODER = True
 
 # Memory optimization settings for large models (T5-large)
 # Reduce these if you encounter OOM errors

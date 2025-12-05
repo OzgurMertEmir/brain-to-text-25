@@ -5,14 +5,36 @@ from transformers import PreTrainedTokenizer
 import numpy as np
 from models.phoneme_to_text.config import MAX_LENGTH, PHONEME_MAP, DATA_AUGMENTATION
 from models.phoneme_to_text.phoneme_augmentor import PhonemeAugmentor
+from models.phoneme_to_text.phoneme_utils.helpers import get_phoneme_tokens
 
 class PhonemeTextDataset:
-    def __init__(self, data_dir: str, tokenizer: PreTrainedTokenizer, cache_dir: str = None):
+    def __init__(
+        self,
+        data_dir: str,
+        tokenizer: PreTrainedTokenizer,
+        cache_dir: str = None,
+        phoneme_unit_mode: str = "mono",
+    ):
         self.data_dir = data_dir
         self.tokenizer = tokenizer
         self.cache_dir = cache_dir
         self.augmentor = PhonemeAugmentor()
-        
+        self.phoneme_unit_mode = phoneme_unit_mode
+
+    def _phoneme_units_to_tokens(self, ph_seq):
+        """
+        Dispatch according to phoneme_unit_mode.
+        Returns a list of string tokens ready for tokenizer.convert_tokens_to_ids().
+        """
+        if self.phoneme_unit_mode == "mono":
+            return get_phoneme_tokens("mono", ph_seq)
+        elif self.phoneme_unit_mode == "diphone":
+            return get_phoneme_tokens("diphone", ph_seq)
+        elif self.phoneme_unit_mode == "triphone":
+            return get_phoneme_tokens("triphone", ph_seq)
+        else:
+            raise ValueError(f"Unknown phoneme_unit_mode={self.phoneme_unit_mode}")
+
     def load_and_prepare_datasets(self) -> DatasetDict:
         """
         Loads disparate sources (CSV/Parquet), normalizes columns, 
@@ -120,7 +142,7 @@ class PhonemeTextDataset:
                 
                 # 2. Namespace Mapping
                 # Map raw 'PHONEME' to '<p:PHONEME.strip()>'
-                token_strs = [PHONEME_MAP.get(p, p) for p in ph_seq]
+                token_strs = self._phoneme_units_to_tokens(ph_seq)
                 
                 # 3. Tokenize
                 # We assume token_strs are now added to tokenizer and are single tokens
@@ -162,7 +184,7 @@ class PhonemeTextDataset:
             
         return dataset_dict
 
-    def prepare_for_trainer_t5(self, dataset_dict: DatasetDict) -> DatasetDict:
+    def prepare_for_trainer_t5(self, dataset_dict: DatasetDict, phoneme_only_encoder: bool) -> DatasetDict:
         """
         Prepare datasets for T5 training.
 
@@ -185,19 +207,29 @@ class PhonemeTextDataset:
                     ph_seq = self.augmentor.augment(ph_seq)
                 
                 # Map phonemes to protected tokens, e.g. 'AA' -> '<p:AA>'
-                token_strs = [PHONEME_MAP.get(p, p) for p in ph_seq]
+                token_strs = self._phoneme_units_to_tokens(ph_seq)
 
-                # Build T5-style source sequence with a task prefix
-                # Example: "transcribe phonemes to text: <p:DH> <p:AH> <p:|> ..."
-                src_text = TASK_PREFIX + " ".join(token_strs)
-
-                # Encode source with T5 tokenizer (this is critical)
-                enc = self.tokenizer(
-                    src_text,
-                    max_length=MAX_LENGTH,
-                    padding="max_length",
-                    truncation=True,
-                )
+                if phoneme_only_encoder:
+                    # Encoder sees only the phoneme tokens as a sequence
+                    enc = self.tokenizer(
+                        token_strs,
+                        is_split_into_words=True,
+                        max_length=MAX_LENGTH,
+                        padding="max_length",
+                        truncation=True,
+                    )
+                else:
+                    # Build T5-style source sequence with a task prefix
+                    # Example: "transcribe phonemes to text: <p:DH> <p:AH> <p:|> ..."
+                    src_text = TASK_PREFIX + " ".join(token_strs)
+    
+                    # Encode source with T5 tokenizer (this is critical)
+                    enc = self.tokenizer(
+                        src_text,
+                        max_length=MAX_LENGTH,
+                        padding="max_length",
+                        truncation=True,
+                    )
 
                 input_ids = enc["input_ids"]
                 attention_mask = enc["attention_mask"]
