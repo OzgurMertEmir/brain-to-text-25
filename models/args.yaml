@@ -3,11 +3,11 @@ model:
   n_units: 768 # number of units per RNN layer
   rnn_dropout: 0.4 # dropout rate for the RNN layers
   rnn_trainable: true # whether the RNN layers are trainable
-  rnn_type: GRU
+  rnn_type: LSTM
   n_layers: 5 # number of RNN layers
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
-  bidirectional: False
+  bidirectional: True
 
   input_network:
     n_input_layers: 1 # number of input layers per network (one network for each day)
@@ -73,8 +73,13 @@ dataset:
     smooth_data: true # whether to smooth the data
     smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
 
+    time_mask_max_frac: 0.05        # up to 5% of time per mask
+    time_mask_num_masks: 2
+    channel_dropout_prob: 0.05      # drop ~5% of channels per trial
+    time_shift_max_steps: 3         # +/- 3 time bins
+
   neural_dim: 512 # dimensionality of the neural data
-  batch_size: 64 # batch size for training
+  batch_size: 32 # batch size for training
   n_classes: 41 # number of classes (phonemes) in the dataset
   max_seq_elements: 500 # maximum number of sequence elements (phonemes) for any trial
   days_per_batch: 4 # number of randomly-selected days to include in each batch

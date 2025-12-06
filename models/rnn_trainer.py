@@ -17,7 +17,7 @@ import json
 import pickle
 
 from dataset import BrainToTextDataset, train_test_split_indicies
-from data_augmentations import gauss_smooth
+from data_augmentations import gauss_smooth, random_time_mask, random_channel_dropout, random_time_shift
 
 import torchaudio.functional as F # for edit distance
 from omegaconf import OmegaConf
@@ -509,6 +509,48 @@ class BrainToTextDecoder_Trainer:
                 cut = np.random.randint(0, self.transform_args['random_cut'])
                 features = features[:, cut:, :]
                 n_time_steps = n_time_steps - cut
+            
+            # randomly drop short time segments
+            if self.transform_args.get('time_mask_max_frac', 0.0) > 0:
+                features = random_time_mask(
+                    features,
+                    max_mask_frac=self.transform_args['time_mask_max_frac'],
+                    num_masks=self.transform_args.get('time_mask_num_masks', 1),
+                )
+
+            # randomly drop entire channels
+            if self.transform_args.get('channel_dropout_prob', 0.0) > 0:
+                features = random_channel_dropout(
+                    features,
+                    drop_prob=self.transform_args['channel_dropout_prob'],
+                )
+
+            # small global time shift per trial
+            if self.transform_args.get('time_shift_max_steps', 0) > 0:
+                features = random_time_shift(
+                    features,
+                    max_shift=self.transform_args['time_shift_max_steps'],
+                )# randomly drop short time segments
+            if self.transform_args.get('time_mask_max_frac', 0.0) > 0:
+                features = random_time_mask(
+                    features,
+                    max_mask_frac=self.transform_args['time_mask_max_frac'],
+                    num_masks=self.transform_args.get('time_mask_num_masks', 1),
+                )
+
+            # randomly drop entire channels
+            if self.transform_args.get('channel_dropout_prob', 0.0) > 0:
+                features = random_channel_dropout(
+                    features,
+                    drop_prob=self.transform_args['channel_dropout_prob'],
+                )
+
+            # small global time shift per trial
+            if self.transform_args.get('time_shift_max_steps', 0) > 0:
+                features = random_time_shift(
+                    features,
+                    max_shift=self.transform_args['time_shift_max_steps'],
+                )
 
         # Apply Gaussian smoothing to data
         # This is done in both training and validation
