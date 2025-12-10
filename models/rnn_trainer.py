@@ -19,6 +19,7 @@ import logging
 
 from rnn_decoder import RNNDecoder
 from ctc_beam_search import CTCBeamSearchDecoder
+from conformer_decoder import ConformerCTCDecoder
 
 from data_augmentations import gauss_smooth
 from dataset import BrainToTextDataset, train_test_split_indicies
@@ -44,6 +45,7 @@ class RNNTrainer:
         # Setup Distributed Training
         self.rank = rank
         self.is_distributed = self.rank is not None
+        self.arch = self.args['model'].get('arch', 'rnn')
 
         if not self.is_distributed or self.rank == 0:
             if args['mode'] == 'train':
@@ -117,25 +119,53 @@ class RNNTrainer:
             torch.manual_seed(seed)
         
         #------------------------------------------------------------------
-        #Init Model
-        self.model = RNNDecoder(
-            neuron_capture_tensor_dim = self.args['model']['n_input_features'],
-            hidden_state_dim = self.args['model']['n_units'],
-            num_days = len(self.args['dataset']['sessions']),
-            num_phonemes = self.args['dataset']['n_classes'],
-            rnn_type = self.args['model']['rnn_type'],
-            rnn_dropout = self.args['model']['rnn_dropout'],
-            input_dropout = self.args['model']['input_network']['input_layer_dropout'],
-            num_rec_layers = self.args['model']['n_layers'],
-            ts_patch_size = self.args['model']['patch_size'],
-            ts_patch_stride = self.args['model']['patch_stride'],
-            bidirectional = self.args['model']['bidirectional']
-        )
+        #------------------------------------------------------------------
+        # Init Model
+        arch = self.arch
+        
+        if arch.lower() == 'rnn':
+            self.model = RNNDecoder(
+                neuron_capture_tensor_dim = self.args['model']['n_input_features'],
+                hidden_state_dim = self.args['model']['n_units'],
+                num_days = len(self.args['dataset']['sessions']),
+                num_phonemes = self.args['dataset']['n_classes'],
+                rnn_type = self.args['model']['rnn_type'],
+                rnn_dropout = self.args['model']['rnn_dropout'],
+                input_dropout = self.args['model']['input_network']['input_layer_dropout'],
+                num_rec_layers = self.args['model']['n_layers'],
+                ts_patch_size = self.args['model']['patch_size'],
+                ts_patch_stride = self.args['model']['patch_stride'],
+                bidirectional = self.args['model']['bidirectional']
+            )
+        elif arch.lower() == 'conformer_torch':
+            self.model = ConformerCTCDecoder(
+                neuron_capture_tensor_dim = self.args['model']['n_input_features'],
+                num_phonemes = self.args['dataset']['n_classes'],
+                num_days = len(self.args['dataset']['sessions']),
+                d_model = self.args['model'].get('d_model', self.args['model']['n_units']),
+                num_layers = self.args['model']['n_layers'],
+                num_heads = self.args['model'].get('num_heads', 4),
+                ff_expansion_factor = self.args['model'].get('ff_expansion_factor', 4),
+                conv_kernel_size = self.args['model'].get('conv_kernel_size', 15),
+                dropout = self.args['model'].get(
+                    'dropout',
+                    self.args['model']['input_network']['input_layer_dropout']
+                ),
+                ts_patch_size = self.args['model']['patch_size'],
+                ts_patch_stride = self.args['model']['patch_stride'],
+            )
+        else:
+            raise ValueError(f"Unknown model architecture: {arch}")
+        
         self.model.to(self.device)
+
         if not self.device == torch.device("mps"):
             if not self.is_distributed or self.rank == 0:
-                self.logger.info("Using torch.compile")
-                self.model = torch.compile(self.model)
+                if arch.lower() == "conformer_torch":
+                    self.logger.info("Skipping torch.compile for Conformer (SDPA backward bug)")
+                else:
+                    self.logger.info("Using torch.compile")
+                    self.model = torch.compile(self.model)
         
         if self.is_distributed:
             self.model = DDP(self.model, device_ids=[self.rank], find_unused_parameters=True)
@@ -489,8 +519,11 @@ class RNNTrainer:
                     features, n_time_steps = self.transform_data(features, n_time_steps, 'val')
 
                     adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-
-                    logits = self.model(features, day_indicies)
+                    
+                    if self.arch.lower() == 'conformer_torch':
+                        logits = self.model(features, day_indicies, lengths=adjusted_lens)
+                    else:
+                        logits = self.model(features, day_indicies)
                     
                     # Try CUDA/MPS direct CTC loss first
                     try:
@@ -669,7 +702,11 @@ class RNNTrainer:
                 features, n_time_steps = self.transform_data(features, n_time_steps, 'train')
                 # As we squash time steps into windows during model forward pass
                 adjusted_lens = ((n_time_steps - self.args['model']['patch_size']) / self.args['model']['patch_stride'] + 1).to(torch.int32)
-                logits = self.model(features, day_indices)
+                if self.arch.lower() == 'conformer_torch':
+                    logits = self.model(features, day_indices, lengths=adjusted_lens)
+                else:
+                    logits = self.model(features, day_indices)
+
                 try:
                     loss = self.ctc_loss(
                         log_probs=torch.permute(logits.log_softmax(2), (1, 0, 2)),  # expected input dimension (T, N, S)

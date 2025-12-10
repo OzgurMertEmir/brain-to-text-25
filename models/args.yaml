@@ -1,20 +1,21 @@
 model:
+  arch: conformer_torch
   n_input_features: 512 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
   n_units: 768 # number of units per RNN layer
   rnn_dropout: 0.4 # dropout rate for the RNN layers
   rnn_trainable: true # whether the RNN layers are trainable
   rnn_type: GRU
-  n_layers: 5 # number of RNN layers
+  n_layers: 10 # number of RNN layers
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
   bidirectional: False
-
+  
   input_network:
     n_input_layers: 1 # number of input layers per network (one network for each day)
     input_layer_sizes:
     - 512 # size of the input layer (number of input features)
     input_trainable: true # whether the input layer is trainable
-    input_layer_dropout: 0.2 # dropout rate for the input layer
+    input_layer_dropout: 0.1 # dropout rate for the input layer
 
 distributed: false # whether to use distributed training
 dist_url: null # url for distributed training
