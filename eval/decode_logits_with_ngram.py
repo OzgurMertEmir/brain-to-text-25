@@ -12,7 +12,7 @@ sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "language_model"))
 
 from language_model.inprocess_decoder import NgramDecoderWrapper
-from llm_scorer import LLMSequentialScorer
+from llm_scorer_client import LLMScorerSubprocess as LLMSequentialScorer
 from decode_utils import rearrange_speech_logits_pt, remove_punctuation
 from lattice_utils import load_word_symbol_table, llm_lattice_rescore
 
@@ -53,6 +53,18 @@ def main():
     args = parse_args()
     print("[info] Loading LM inputs from", args.lm_inputs_h5)
 
+    # LLM scorer for N-best
+    model = args.llm_rescorer_model
+    llm = LLMSequentialScorer(model_name=model)
+    alpha = args.alpha
+    beta  = args.beta
+    gamma_lattice  = args.gamma_lattice
+    gamma_sentence = args.gamma_sentence
+    
+    do_rescore = args.llm_rescore
+    use_lattice_llm = args.use_lattice_llm
+    do_rescore_cpp = not use_lattice_llm
+
     with h5py.File(args.lm_inputs_h5, "r") as f:
         logits_all = f["logits"][:]   # [N, Tmax, V]
         T_all      = f["T"][:]        # [N]
@@ -76,19 +88,6 @@ def main():
         nbest=n,
     )
     print("[info] Decoder initialized.")
-
-    # LLM scorer for N-best
-    model = args.llm_rescorer_model
-    llm = LLMSequentialScorer(model_name=model)
-    alpha = args.alpha
-    beta  = args.beta
-    gamma_lattice  = args.gamma_lattice
-    gamma_sentence = args.gamma_sentence
-    
-    do_rescore = args.llm_rescore
-    use_lattice_llm = args.use_lattice_llm
-    do_rescore_cpp = not use_lattice_llm
-    
 
     if use_lattice_llm:
         words_txt = os.path.join(args.lm_dir, "words.txt")
@@ -133,7 +132,7 @@ def main():
                 nbest=n,
             )
 
-            # Strip search-time llm_score; we’ll optionally recompute with LLM
+            # Strip search-time llm_score; we'll optionally recompute with LLM
             nbest = [(s, ac, lm) for (s, ac, lm, llm_search) in lattice_nbest]
 
             if not return_nbest:
@@ -145,7 +144,8 @@ def main():
         if not return_nbest:
             if not nbest:
                 best_sentence = ""
-            else: best_sentence = nbest
+            else:
+                best_sentence = nbest
         else:
             sentences = [s for (s, ac, lm) in nbest]
             ac_scores = np.array([ac for (_, ac, _) in nbest], dtype=np.float32)

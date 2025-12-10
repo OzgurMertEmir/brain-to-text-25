@@ -8,14 +8,18 @@ class LLMSequentialScorer:
     """
 
     def __init__(self, model_name: str, device: str = None):
-        if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = torch.device(device)
-        self.tok = AutoTokenizer.from_pretrained(model_name)
-        self.tok.padding_side = "right"
-        if self.tok.pad_token is None:
-            self.tok.pad_token = self.tok.eos_token
-        self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device).eval()
+        try:
+            if device is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.device = torch.device(device)
+            self.tok = AutoTokenizer.from_pretrained(model_name)
+            self.tok.padding_side = "right"
+            if self.tok.pad_token is None:
+                self.tok.pad_token = self.tok.eos_token
+            self.model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device).eval()
+            print(f"Loaded {model_name} Re_Scorer LLM model.")
+        except Exception as e:
+            print(f"Unable to load Re-Scorer LLM model: {e}")
 
     @torch.inference_mode()
     def sentence_logprob(self, sentences, prefix: str = ""):

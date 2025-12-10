@@ -9,8 +9,13 @@ Key differences from rnn_gpt2_eval.py:
 - Extracts N-best phoneme hypotheses with acoustic scores
 - Generates text for each hypothesis using GPT-2
 - Combines acoustic + LLM scores for final prediction
+
+Usage:
+    python acoustic_rnn_gpt2_eval.py --alpha 1.0 --gamma 0.5 --checkpoint baseline_lstm_bi
+    python acoustic_rnn_gpt2_eval.py --alpha 0.33 --gamma 1.0 --checkpoint baseline_lstm_bi_timemask --wer-log wer_results.csv
 """
 
+import argparse
 import torch
 import os
 from omegaconf import OmegaConf
@@ -30,30 +35,49 @@ import numpy as np
 from eval.llm_scorer import LLMSequentialScorer
 
 # ===================================================================
+# ARGUMENT PARSING
+# ===================================================================
+parser = argparse.ArgumentParser(description="Acoustic-Aware RNN + GPT2 Evaluation with N-best Rescoring")
+parser.add_argument("--alpha", type=float, default=1.0, help="Weight for acoustic score (default: 1.0)")
+parser.add_argument("--gamma", type=float, default=0.5, help="Weight for GPT2 LLM score (default: 0.5)")
+parser.add_argument("--checkpoint", type=str, default="baseline_lstm_bi", help="RNN model checkpoint name (default: baseline_lstm_bi)")
+parser.add_argument("--eval-type", type=str, default="val", choices=["val", "test"], help="Evaluation type (default: val)")
+parser.add_argument("--nbest", type=int, default=50, help="Number of hypotheses to consider (default: 50)")
+parser.add_argument("--beam-width", type=int, default=100, help="Beam width for CTC decoding (default: 100)")
+parser.add_argument("--wer-log", type=str, default=None, help="Path to append WER results (CSV format)")
+parser.add_argument("--output", type=str, default=None, help="Output predictions path (auto-generated if not specified)")
+args = parser.parse_args()
+
+# ===================================================================
 # CONFIGURATION
 # ===================================================================
-EVAL_TYPE = "val"  # "val" or "test"
+EVAL_TYPE = args.eval_type
 CSV_DESC_PATH = "../data/t15_copyTaskData_description.csv"
 DATA_DIR = "../data/hdf5_data_final"
 GPT2_CHECKPOINT_PATH = "./phoneme_to_text/checkpoints/phoneme_gpt2_ckpt/epoch_3"
-RNN_MODEL_NAME = "baseline_lstm_bi"
+RNN_MODEL_NAME = args.checkpoint
 RNN_MODEL_PATH = f"trained_models/{RNN_MODEL_NAME}"
 
 # N-best rescoring parameters
-NBEST = 50  # Number of hypotheses to consider
-BEAM_WIDTH = 100  # Beam width for CTC decoding (should be >= NBEST)
+NBEST = args.nbest
+BEAM_WIDTH = args.beam_width
 
-# Scoring weights (tune these!)
-ALPHA = 1.0   # Weight for acoustic score
-GAMMA = 0.5   # Weight for GPT2 LLM score
+# Scoring weights
+ALPHA = args.alpha
+GAMMA = args.gamma
 
 # LLM scorer model
-LLM_RESCORER_MODEL = "distilgpt2"  # Model for scoring (can be different from generator)
+LLM_RESCORER_MODEL = "mistralai/Mistral-7B-v0.1" #"distilgpt2"  # Model for scoring (can be different from generator)
 
 # Other settings
 BATCH_SIZE = 8  # Batch size for processing
 STORE_NBEST_INFO = True  # Store N-best hypotheses and scores in CSV
-PREDICTIONS_PATH = f"phoneme_prediction_results_gpt2_acoustic_nbest{NBEST}_alpha{ALPHA}_gamma{GAMMA}.csv"
+
+# Auto-generate output path if not specified
+if args.output:
+    PREDICTIONS_PATH = args.output
+else:
+    PREDICTIONS_PATH = f"phoneme_prediction_results_{RNN_MODEL_NAME}_alpha{ALPHA}_gamma{GAMMA}_nbest{NBEST}_mistral7b.csv"
 
 # ===================================================================
 # SETUP
@@ -354,4 +378,15 @@ if EVAL_TYPE == "val":
 
     wer = 100.0 * total_ed / max(1, total_true_len)
     print(f"\n📊 [METRICS] Word Error Rate: {wer:.2f}%")
-    print(f"   (α={ALPHA}, γ={GAMMA}, N-best={NBEST})")
+    print(f"   (checkpoint={RNN_MODEL_NAME}, α={ALPHA}, γ={GAMMA}, N-best={NBEST})")
+
+    # Log WER to file if specified
+    if args.wer_log:
+        import csv
+        file_exists = os.path.exists(args.wer_log)
+        with open(args.wer_log, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["checkpoint", "alpha", "gamma", "nbest", "wer"])
+            writer.writerow([RNN_MODEL_NAME, ALPHA, GAMMA, NBEST, f"{wer:.2f}"])
+        print(f"📝 WER logged to {args.wer_log}")

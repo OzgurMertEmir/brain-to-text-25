@@ -4,8 +4,18 @@ Acoustic-Aware RNN + T5 Evaluation Script
 This script implements N-best rescoring by combining:
 1. Acoustic scores from CTC beam search (RNN decoder confidence)
 2. Language model scores from a pretrained LLM (e.g., T5)
+
+Key differences from rnn_t5_eval.py:
+- Extracts N-best phoneme hypotheses with acoustic scores
+- Generates text for each hypothesis using T5
+- Combines acoustic + LLM scores for final prediction
+
+Usage:
+    python acoustic_rnn_t5_eval.py --alpha 1.0 --gamma 0.5 --checkpoint baseline_lstm_bi
+    python acoustic_rnn_t5_eval.py --alpha 0.33 --gamma 1.0 --checkpoint baseline_lstm_bi_timemask --wer-log wer_results.csv
 """
 
+import argparse
 import torch
 import os
 from omegaconf import OmegaConf
@@ -25,36 +35,65 @@ import numpy as np
 from eval.llm_scorer import LLMSequentialScorer
 
 # ===================================================================
+# ARGUMENT PARSING
+# ===================================================================
+parser = argparse.ArgumentParser(description="Acoustic-Aware RNN + T5 Evaluation with N-best Rescoring")
+parser.add_argument("--alpha", type=float, default=1.0, help="Weight for acoustic score (default: 1.0)")
+parser.add_argument("--gamma", type=float, default=0.5, help="Weight for T5 LLM score (default: 0.5)")
+parser.add_argument("--checkpoint", type=str, default="baseline_lstm_bi", help="RNN model checkpoint name (default: baseline_lstm_bi)")
+parser.add_argument("--eval-type", type=str, default="val", choices=["val", "test"], help="Evaluation type (default: val)")
+parser.add_argument("--nbest", type=int, default=50, help="Number of hypotheses to consider (default: 50)")
+parser.add_argument("--beam-width", type=int, default=100, help="Beam width for CTC decoding (default: 100)")
+# parser.add_argument("--llm-scorer", type=str, default="distilgpt2", help="LLM model for rescoring (default: distilgpt2)")
+parser.add_argument("--t5-checkpoint", type=str, default="./phoneme_to_text/checkpoints/phoneme_t5_base_clean_ckpt/epoch_3", help="T5 checkpoint path (default: ./phoneme_to_text/checkpoints/phoneme_t5_base_clean_ckpt/epoch_3)")
+parser.add_argument("--wer-log", type=str, default=None, help="Path to append WER results (CSV format)")
+parser.add_argument("--output", type=str, default=None, help="Output predictions path (auto-generated if not specified)")
+args = parser.parse_args()
+
+# ===================================================================
 # CONFIGURATION
 # ===================================================================
-EVAL_TYPE = "val"  # "val" or "test"
+EVAL_TYPE = args.eval_type
 CSV_DESC_PATH = "../data/t15_copyTaskData_description.csv"
 DATA_DIR = "../data/hdf5_data_final"
-T5_CHECKPOINT_PATH = "./phoneme_to_text/checkpoints/phoneme_t5_base_ckpt/epoch_3"
-RNN_MODEL_NAME = "baseline_lstm_bi"
+T5_CHECKPOINT_PATH = args.t5_checkpoint
+RNN_MODEL_NAME = args.checkpoint
 RNN_MODEL_PATH = f"trained_models/{RNN_MODEL_NAME}"
 
 # N-best rescoring parameters
-NBEST = 50  # Number of hypotheses to consider
-BEAM_WIDTH = 100  # Beam width for CTC decoding (should be >= NBEST)
+NBEST = args.nbest
+BEAM_WIDTH = args.beam_width
 
-# Scoring weights (tune these!)
-ALPHA = 1.0   # Weight for acoustic score
-GAMMA = 0.5   # Weight for LLM score
+# Scoring weights
+ALPHA = args.alpha
+GAMMA = args.gamma
 
-# LLM scorer model (for rescoring generated text)
-LLM_RESCORER_MODEL = "distilgpt2"  # Model for scoring (can be different from T5 generator)
+# LLM scorer model
+LLM_RESCORER_MODEL = "mistralai/Mistral-7B-v0.1"
 
 # Other settings
 BATCH_SIZE = 8  # Batch size for processing
 STORE_NBEST_INFO = True  # Store N-best hypotheses and scores in CSV
-PREDICTIONS_PATH = f"phoneme_prediction_results_t5_acoustic_nbest{NBEST}_alpha{ALPHA}_gamma{GAMMA}.csv"
+
+# Auto-generate output path if not specified
+if args.output:
+    PREDICTIONS_PATH = args.output
+else:
+    PREDICTIONS_PATH = f"phoneme_prediction_results_{RNN_MODEL_NAME}_t5_alpha{ALPHA}_gamma{GAMMA}_nbest{NBEST}_{LLM_RESCORER_MODEL.replace('/', '_')}.csv"
 
 # ===================================================================
-# SETUP
+# SETUP - Multi-GPU Configuration
 # ===================================================================
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-print(f"🖥️  Using device: {device}")
+# Distribute models across 4 GPUs to avoid OOM
+rnn_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+t5_device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+llm_device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+# cuda:3 available for expansion if needed
+
+print(f"🖥️  Multi-GPU Setup:")
+print(f"   RNN Model: {rnn_device}")
+print(f"   T5 Model: {t5_device}")
+print(f"   LLM Scorer: {llm_device}")
 
 model_args = OmegaConf.load(os.path.join(RNN_MODEL_PATH, "checkpoint/args.yaml"))
 
@@ -109,7 +148,7 @@ print(f"Total {EVAL_TYPE} trials loaded: {total_trials}\n")
 print(f"📀 Loading RNN Model from {RNN_MODEL_PATH}....")
 checkpoint = torch.load(
     os.path.join(RNN_MODEL_PATH, "checkpoint/best_checkpoint"),
-    map_location=device,
+    map_location=rnn_device,
     weights_only=False
 )
 
@@ -135,20 +174,20 @@ rnn_model = RNNDecoder(
 )
 
 rnn_model.load_state_dict(cleaned_state_dict)
-rnn_model.to(device).eval()
+rnn_model.to(rnn_device).eval()
 
 # ===================================================================
 # Load T5 Model
 # ===================================================================
 print(f"📀 Loading T5 Model from {T5_CHECKPOINT_PATH}....")
 t5_tokenizer = T5Tokenizer.from_pretrained(T5_CHECKPOINT_PATH, legacy=False)
-t5_model = T5ForConditionalGeneration.from_pretrained(T5_CHECKPOINT_PATH).to(device)
+t5_model = T5ForConditionalGeneration.from_pretrained(T5_CHECKPOINT_PATH).to(t5_device)
 
 # ===================================================================
 # Load LLM Scorer
 # ===================================================================
 print(f"📀 Loading LLM Scorer ({LLM_RESCORER_MODEL})....")
-llm_scorer = LLMSequentialScorer(model_name=LLM_RESCORER_MODEL)
+llm_scorer = LLMSequentialScorer(model_name=LLM_RESCORER_MODEL, device=str(llm_device))
 
 # ===================================================================
 # Initialize CTC Decoder
@@ -177,22 +216,22 @@ def decode_batch(neural_batch, session_indices):
     """
     batch_logits = []
 
-    with torch.autocast(device_type=str(device), enabled=model_args.use_amp, dtype=torch.bfloat16):
+    with torch.autocast(device_type=str(rnn_device).split(":")[0], enabled=model_args.use_amp, dtype=torch.bfloat16):
         for i, (neural_input, session_idx) in enumerate(zip(neural_batch, session_indices)):
             # Convert to tensor
-            x = torch.tensor(neural_input[None, ...], dtype=torch.bfloat16, device=device)
+            x = torch.tensor(neural_input[None, ...], dtype=torch.bfloat16, device=rnn_device)
 
             # Apply smoothing
             x = gauss_smooth(
                 inputs=x,
-                device=device,
+                device=rnn_device,
                 smooth_kernel_std=model_args.dataset.data_transforms.smooth_kernel_std,
                 smooth_kernel_size=model_args.dataset.data_transforms.smooth_kernel_size,
                 padding="valid",
             )
 
             # Forward pass
-            logits, _ = rnn_model(x=x, day_idx=torch.tensor([session_idx], device=device), states=None, return_state=True)
+            logits, _ = rnn_model(x=x, day_idx=torch.tensor([session_idx], device=rnn_device), states=None, return_state=True)
             batch_logits.append(logits[0].float().cpu().numpy())
 
     return batch_logits
@@ -262,7 +301,7 @@ with tqdm(total=total_trials, desc="Processing batches", unit="trial") as pbar:
                 phoneme_sequences,
                 t5_model,
                 t5_tokenizer,
-                device
+                t5_device
             )
 
             # Step 4: Score with LLM
@@ -348,4 +387,15 @@ if EVAL_TYPE == "val":
 
     wer = 100.0 * total_ed / max(1, total_true_len)
     print(f"\n📊 [METRICS] Word Error Rate: {wer:.2f}%")
-    print(f"   (α={ALPHA}, γ={GAMMA}, N-best={NBEST})")
+    print(f"   (checkpoint={RNN_MODEL_NAME}, α={ALPHA}, γ={GAMMA}, N-best={NBEST})")
+
+    # Log WER to file if specified
+    if args.wer_log:
+        import csv
+        file_exists = os.path.exists(args.wer_log)
+        with open(args.wer_log, 'a', newline='') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(["checkpoint", "alpha", "gamma", "nbest", "llm_scorer", "wer"])
+            writer.writerow([RNN_MODEL_NAME, ALPHA, GAMMA, NBEST, LLM_RESCORER_MODEL, f"{wer:.2f}"])
+        print(f"📝 WER logged to {args.wer_log}")
