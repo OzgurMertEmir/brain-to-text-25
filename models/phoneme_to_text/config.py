@@ -1,11 +1,12 @@
 # 1. Hyperparameters
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 MAX_LENGTH = 1024  # Adjust based on your longest phoneme sequence + text
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1e-4
 EPOCHS = 3
 SEED = 42
 GRAD_ACCUMULATION_STEPS = 4
 DATA_AUGMENTATION = True
+PHONEME_TYPE = "diphone" # phoneme | diphone | triphone
 
 # Memory optimization settings for large models (T5-large)
 # Reduce these if you encounter OOM errors
