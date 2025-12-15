@@ -21,7 +21,7 @@ from rnn_decoder import RNNDecoder
 from ctc_beam_search import CTCBeamSearchDecoder
 from conformer_decoder import ConformerCTCDecoder
 
-from data_augmentations import gauss_smooth
+from data_augmentations import gauss_smooth, random_time_mask, random_channel_dropout, random_time_shift
 from dataset import BrainToTextDataset, train_test_split_indicies
 
 # Configure TF32 using the new API (avoids deprecation warnings in PyTorch 2.9+)
@@ -661,6 +661,126 @@ class RNNTrainer:
             # Save the args file alongside the checkpoint
             with open(os.path.join(self.args['checkpoint_dir'], 'args.yaml'), 'w') as f:
                 OmegaConf.save(config=self.args, f=f)
+    
+    def create_attention_mask(self, sequence_lengths):
+
+        max_length = torch.max(sequence_lengths).item()
+
+        batch_size = sequence_lengths.size(0)
+
+        # Create a mask for valid key positions (columns)
+        # Shape: [batch_size, max_length]
+        key_mask = torch.arange(max_length, device=sequence_lengths.device).expand(batch_size, max_length)
+        key_mask = key_mask < sequence_lengths.unsqueeze(1)
+
+        # Expand key_mask to [batch_size, 1, 1, max_length]
+        # This will be broadcast across all query positions
+        key_mask = key_mask.unsqueeze(1).unsqueeze(1)
+
+        # Create the attention mask of shape [batch_size, 1, max_length, max_length]
+        # by broadcasting key_mask across all query positions
+        attention_mask = key_mask.expand(batch_size, 1, max_length, max_length)
+
+        # Convert boolean mask to float mask:
+        # - True (valid key positions) -> 0.0 (no change to attention scores)
+        # - False (padding key positions) -> -inf (will become 0 after softmax)
+        attention_mask_float = torch.where(attention_mask,
+                                        True,
+                                        False)
+
+        return attention_mask_float
+
+    def transform_data(self, features, n_time_steps, mode = 'train'):
+        '''
+        Apply various augmentations and smoothing to data
+        Performing augmentations is much faster on GPU than CPU
+        '''
+
+        data_shape = features.shape
+        batch_size = data_shape[0]
+        channels = data_shape[-1]
+
+        # We only apply these augmentations in training
+        if mode == 'train':
+            # add static gain noise
+            if self.transform_args['static_gain_std'] > 0:
+                warp_mat = torch.tile(torch.unsqueeze(torch.eye(channels), dim = 0), (batch_size, 1, 1))
+                warp_mat += torch.randn_like(warp_mat, device=self.device) * self.transform_args['static_gain_std']
+
+                features = torch.matmul(features, warp_mat)
+
+            # add white noise
+            if self.transform_args['white_noise_std'] > 0:
+                features += torch.randn(data_shape, device=self.device) * self.transform_args['white_noise_std']
+
+            # add constant offset noise
+            if self.transform_args['constant_offset_std'] > 0:
+                features += torch.randn((batch_size, 1, channels), device=self.device) * self.transform_args['constant_offset_std']
+
+            # add random walk noise
+            if self.transform_args['random_walk_std'] > 0:
+                features += torch.cumsum(torch.randn(data_shape, device=self.device) * self.transform_args['random_walk_std'], dim =self.transform_args['random_walk_axis'])
+
+            # randomly cutoff part of the data timecourse
+            if self.transform_args['random_cut'] > 0:
+                cut = np.random.randint(0, self.transform_args['random_cut'])
+                features = features[:, cut:, :]
+                n_time_steps = n_time_steps - cut
+            
+            # randomly drop short time segments
+            if self.transform_args.get('time_mask_max_frac', 0.0) > 0:
+                features = random_time_mask(
+                    features,
+                    max_mask_frac=self.transform_args['time_mask_max_frac'],
+                    num_masks=self.transform_args.get('time_mask_num_masks', 1),
+                )
+
+            # randomly drop entire channels
+            if self.transform_args.get('channel_dropout_prob', 0.0) > 0:
+                features = random_channel_dropout(
+                    features,
+                    drop_prob=self.transform_args['channel_dropout_prob'],
+                )
+
+            # small global time shift per trial
+            if self.transform_args.get('time_shift_max_steps', 0) > 0:
+                features = random_time_shift(
+                    features,
+                    max_shift=self.transform_args['time_shift_max_steps'],
+                )# randomly drop short time segments
+            if self.transform_args.get('time_mask_max_frac', 0.0) > 0:
+                features = random_time_mask(
+                    features,
+                    max_mask_frac=self.transform_args['time_mask_max_frac'],
+                    num_masks=self.transform_args.get('time_mask_num_masks', 1),
+                )
+
+            # randomly drop entire channels
+            if self.transform_args.get('channel_dropout_prob', 0.0) > 0:
+                features = random_channel_dropout(
+                    features,
+                    drop_prob=self.transform_args['channel_dropout_prob'],
+                )
+
+            # small global time shift per trial
+            if self.transform_args.get('time_shift_max_steps', 0) > 0:
+                features = random_time_shift(
+                    features,
+                    max_shift=self.transform_args['time_shift_max_steps'],
+                )
+
+        # Apply Gaussian smoothing to data
+        # This is done in both training and validation
+        if self.transform_args['smooth_data']:
+            features = gauss_smooth(
+                inputs = features,
+                device = self.device,
+                smooth_kernel_std = self.transform_args['smooth_kernel_std'],
+                smooth_kernel_size= self.transform_args['smooth_kernel_size'],
+                )
+
+
+        return features, n_time_steps
                 
     def train(self):
         #------------------------------------------------------------------

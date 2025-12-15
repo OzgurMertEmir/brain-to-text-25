@@ -79,6 +79,11 @@ dataset:
     smooth_data: true # whether to smooth the data
     smooth_kernel_std: 2 # standard deviation of the smoothing kernel applied to the data
 
+    time_mask_max_frac: 0.05        # up to 5% of time per mask
+    time_mask_num_masks: 2
+    channel_dropout_prob: 0.05      # drop ~5% of channels per trial
+    time_shift_max_steps: 3         # +/- 3 time bins
+
   neural_dim: 512 # dimensionality of the neural data
   batch_size: 64 # batch size for training
   n_classes: 41 # number of classes (phonemes) in the dataset

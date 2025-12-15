@@ -38,3 +38,92 @@ def gauss_smooth(inputs, device, smooth_kernel_std=2, smooth_kernel_size=100,  p
     # Perform convolution
     smoothed = F.conv1d(inputs, gaussKernel, padding=padding, groups=C)
     return smoothed.permute(0, 2, 1)  # [B, T, C]
+
+def random_time_mask(inputs, max_mask_frac=0.1, num_masks=1):
+    """
+    Zero out random contiguous time spans (SpecAugment-style).
+
+    Args:
+        inputs:  (B, T, C) tensor on any device.
+        max_mask_frac: maximum fraction of T for a single mask.
+        num_masks: number of masks per example.
+
+    Returns:
+        Tensor of same shape, with some time windows set to zero.
+    """
+    if max_mask_frac <= 0 or num_masks <= 0:
+        return inputs
+
+    B, T, C = inputs.shape
+    max_len = int(T * max_mask_frac)
+    if max_len < 1:
+        return inputs
+
+    device = inputs.device
+    out = inputs.clone()
+
+    for b in range(B):
+        for _ in range(num_masks):
+            L = torch.randint(1, max_len + 1, (1,), device=device).item()
+            start = torch.randint(0, max(1, T - L + 1), (1,), device=device).item()
+            out[b, start:start + L, :] = 0.0
+
+    return out
+
+
+def random_channel_dropout(inputs, drop_prob=0.1):
+    """
+    Drop whole channels for each trial (simulates lost / very noisy electrodes).
+
+    Args:
+        inputs: (B, T, C) tensor.
+        drop_prob: probability of dropping each channel independently.
+
+    Returns:
+        Tensor of same shape with some channels zeroed.
+    """
+    if drop_prob <= 0.0:
+        return inputs
+
+    B, T, C = inputs.shape
+    device = inputs.device
+
+    # (B, C) mask: True = keep, False = drop
+    mask = (torch.rand(B, C, device=device) > drop_prob).float()
+    mask = mask.view(B, 1, C)  # broadcast over time
+
+    return inputs * mask
+
+
+def random_time_shift(inputs, max_shift=5):
+    """
+    Apply a small random integer time shift per trial, zero-padding exposed edges.
+
+    Args:
+        inputs: (B, T, C) tensor.
+        max_shift: maximum shift in time steps (both positive and negative).
+
+    Returns:
+        Shifted tensor of same shape.
+    """
+    if max_shift <= 0:
+        return inputs
+
+    B, T, C = inputs.shape
+    device = inputs.device
+    shifts = torch.randint(-max_shift, max_shift + 1, (B,), device=device)
+
+    out = torch.zeros_like(inputs)
+    for b in range(B):
+        s = int(shifts[b].item())
+        if s > 0:
+            # shift to the right
+            out[b, s:, :] = inputs[b, :T - s, :]
+        elif s < 0:
+            # shift to the left
+            s = -s
+            out[b, :T - s, :] = inputs[b, s:, :]
+        else:
+            out[b] = inputs[b]
+
+    return out
