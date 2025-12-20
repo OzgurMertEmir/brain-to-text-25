@@ -142,17 +142,17 @@ class RNNTrainer:
                 neuron_capture_tensor_dim = self.args['model']['n_input_features'],
                 num_phonemes = self.args['dataset']['n_classes'],
                 num_days = len(self.args['dataset']['sessions']),
+                input_dropout = self.args['model']['input_network']['input_layer_dropout'],
                 d_model = self.args['model'].get('d_model', self.args['model']['n_units']),
                 num_layers = self.args['model']['n_layers'],
                 num_heads = self.args['model'].get('num_heads', 4),
                 ff_expansion_factor = self.args['model'].get('ff_expansion_factor', 4),
                 conv_kernel_size = self.args['model'].get('conv_kernel_size', 15),
-                dropout = self.args['model'].get(
-                    'dropout',
-                    self.args['model']['input_network']['input_layer_dropout']
-                ),
+                dropout = self.args['model'].get('rnn_dropout', 0.1),
                 ts_patch_size = self.args['model']['patch_size'],
                 ts_patch_stride = self.args['model']['patch_stride'],
+                use_group_norm = self.args['model'].get('use_group_norm', False),
+                convolution_first = self.args['model'].get('convolution_first', False), 
             )
         else:
             raise ValueError(f"Unknown model architecture: {arch}")
