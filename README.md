@@ -1,5 +1,7 @@
 # Brain To Text 25 | DL FA25 | Group Project
 
+You can read our unpublished manuscript here: [Download Paper PDF](./Brain2Text2025.pdf)
+
 ![Speech neuroprosthesis overview](b2txt_methods_overview.png)
 
 ## Competition
